@@ -13,9 +13,15 @@
 #     vars alone are not a boundary; a module that ignores them would reach prod.
 #
 set -euo pipefail
+# Exit codes: 0 = all passed, 1 = some test files failed, 2 = could not run at
+# all. update.sh MUST distinguish 1 from 2 — treating an infrastructure failure
+# as "zero tests failed" would silently blank the regression baseline.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=./common.sh
 source "$HERE/lib/common.sh"
+
+# Infrastructure failure = exit 2 (see the header). Overrides common.sh's die.
+die() { printf '%sFAIL%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; exit 2; }
 
 REPO="${1:?usage: run-tests.sh <repo-dir>}"
 [[ -d "$REPO" ]] || die "no such repo dir: $REPO"
@@ -63,34 +69,84 @@ SITE="$(ls -d "$TESTVENV"/lib/python*/site-packages 2>/dev/null | head -1)"
 # Sorts before the guard below, which needs psycopg2 importable.
 printf '%s\n' "$PROD_SITE" > "$SITE/za-prod-site.pth"
 
-# Prod-connection guard. Must be a .pth: Debian ships
-# /usr/lib/python3/sitecustomize.py which shadows a venv-local sitecustomize.py.
-PTH="$SITE/zz-evelio-prod-guard.pth"
-cat > "$PTH" <<'PYEOF'
-import sys, os
-def _guard():
+# ---------------------------------------------------------------------------
+# Prod-connection guard.
+#
+# TWO mistakes are easy here and both make the guard silently inert:
+#   * a venv-local sitecustomize.py is shadowed by Debian's
+#     /usr/lib/python3/dist-packages/sitecustomize.py, and
+#   * a .pth file is processed LINE BY LINE and only lines starting with
+#     `import` are executed — a multi-line program in a .pth does nothing at
+#     all, with no error. (An earlier version of this file made exactly that
+#     mistake; the guard it advertised never ran.)
+# So: a real module, plus a one-line import-only .pth. Verified below.
+# ---------------------------------------------------------------------------
+cat > "$SITE/evelio_prod_guard.py" <<'PYGUARD'
+"""Refuse, at connect time, any psycopg2 connection that points at production.
+
+Installed into the pre-deploy test venv. Several app modules default to
+PG_PORT=5432 / PG_DB=evelio (PROD) when their vars are unset, so environment
+variables alone are not a boundary.
+"""
+import os
+import sys
+
+_LOCAL = ("localhost", "127.0.0.1", "::1", "")
+
+
+def _install():
     try:
         import psycopg2
     except Exception:
         return
+    if getattr(psycopg2.connect, "_evelio_guarded", False):
+        return
     _real = psycopg2.connect
-    def connect(*a, **kw):
-        port = str(kw.get("port") or os.environ.get("PG_PORT") or "5432")
-        db   = kw.get("dbname") or kw.get("database") or os.environ.get("PG_DB") or "evelio"
-        host = str(kw.get("host") or os.environ.get("PG_HOST") or "localhost")
-        if str(port) == "5432" or db == "evelio" or host not in ("localhost", "127.0.0.1", "::1"):
+
+    def connect(*args, **kwargs):
+        port = str(kwargs.get("port") or os.environ.get("PG_PORT") or "5432")
+        db = (kwargs.get("dbname") or kwargs.get("database")
+              or os.environ.get("PG_DB") or "evelio")
+        host = str(kwargs.get("host") or os.environ.get("PG_HOST") or "localhost")
+        dsn = args[0] if args and isinstance(args[0], str) else ""
+        if "5432" in dsn or "dbname=evelio " in dsn + " ":
+            port, db = "5432", "evelio"
+        if port == "5432" or db == "evelio" or host not in _LOCAL:
             sys.stderr.write(
                 "\n*** BLOCKED: the pre-deploy test suite tried to connect to "
                 "port=%s db=%s host=%s.\n*** That is the PRODUCTION database. "
                 "Tests never talk to prod.\n\n" % (port, db, host))
             raise SystemExit(3)
-        return _real(*a, **kw)
+        return _real(*args, **kwargs)
+
+    connect._evelio_guarded = True
     psycopg2.connect = connect
-_guard()
-PYEOF
+
+
+_install()
+PYGUARD
+
+# One line, starting with `import` — the only form a .pth actually executes.
+printf 'import evelio_prod_guard\n' > "$SITE/zz-evelio-prod-guard.pth"
 
 "$TESTVENV/bin/python" -c 'import pytest' 2>/dev/null \
   || { info "installing pytest into the test venv"; "$TESTVENV/bin/pip" install -q pytest || die "could not install pytest"; }
+
+# Prove the guard is live. A guard nobody verifies is a comment, not a control:
+# this exact assertion is what would have caught the inert-.pth bug.
+guard_rc=0
+"$TESTVENV/bin/python" -c \
+  'import psycopg2; psycopg2.connect(host="127.0.0.1", port=5432, dbname="evelio", user="x")' \
+  >/dev/null 2>&1 || guard_rc=$?
+# Exit 3 is the guard refusing. Anything else (0 = it connected, 1 = it merely
+# failed to connect, 2 = import error) means the guard is not doing its job.
+if [[ "$guard_rc" != "3" ]]; then
+  die "the prod-connection guard is NOT active in $TESTVENV (got exit $guard_rc, want 3).
+       A connection to port 5432 / db evelio must be refused by the guard, not
+       merely fail. Refusing to run the test suite without it — several app
+       modules default to prod when PG_* is unset."
+fi
+ok "prod-connection guard verified active (refused a port-5432 connect)"
 
 # ---------------------------------------------------------------- run it --
 # ONE PROCESS PER TEST FILE. The suite's modules stub each other in sys.modules

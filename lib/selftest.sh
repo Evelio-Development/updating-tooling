@@ -55,11 +55,21 @@ SQL
 }
 
 take_backup() {   # -> $WORK/db.dump, $WORK/rowcounts.pre
-  capture_rowcounts "$WORK/rowcounts.pre"
-  docker exec "$PG_CONTAINER" pg_dump -U "$PG_USER" -d "$PG_DB" -Fc -Z1 -f /tmp/st.dump
-  docker cp "$PG_CONTAINER":/tmp/st.dump "$WORK/db.dump" >/dev/null
-  docker exec "$PG_CONTAINER" rm -f /tmp/st.dump
+  dump_and_count_consistently "$WORK/db.dump" "$WORK/rowcounts.pre" full >/dev/null 2>&1
 }
+
+# A writer that keeps inserting while the backup is taken — production is never
+# idle, and the counts/dump must still agree. Case 5 exists because the original
+# implementation counted BEFORE dumping and every real revert would have aborted.
+start_writer() {
+  ( while :; do
+      docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -qtAX -c \
+        "INSERT INTO telemetry_raw (payload) VALUES ('bg')" </dev/null >/dev/null 2>&1
+      sleep 0.05
+    done ) &
+  WRITER_PID=$!
+}
+stop_writer() { [[ -n "${WRITER_PID:-}" ]] && kill "$WRITER_PID" 2>/dev/null; wait "$WRITER_PID" 2>/dev/null; WRITER_PID=""; }
 
 hdr "selftest: revert machinery (container=$PG_CONTAINER, db=$PG_DB)"
 docker inspect "$PG_CONTAINER" >/dev/null 2>&1 || die "staging container not running"
@@ -91,7 +101,7 @@ hdr "2. row-count mismatch must abort without touching the live database"
 fresh_live
 take_backup
 # corrupt the EXPECTATION, so the verified restore cannot match it
-sed -i 's/^users|10/users|999/' "$WORK/rowcounts.pre"
+sed -i 's/^public\.users|10/public.users|999/' "$WORK/rowcounts.pre"
 psql_prod -q -c "INSERT INTO users (email,note) VALUES ('keepme@x','must-survive')"
 before="$(q 'select count(*) from users')"
 # subshell: die() exits, and here that must fail the CASE, not the harness
@@ -133,6 +143,62 @@ restore_db_swap "$WORK/db.dump" "$WORK/rowcounts.pre" soft >/dev/null 2>&1 \
   && ok "soft restore_db_swap succeeded" || { warn "soft restore FAILED"; (( ++FAIL )); }
 check "users rolled back to 10"                 "$(q 'select count(*) from users')" "10"
 check "telemetry PRESERVED (150, not 100)"      "$(q 'select count(*) from telemetry_raw')" "150"
+
+# ---------------------------------------------------------------- case 5 --
+hdr "5. writes DURING the backup must not break the restore"
+fresh_live
+start_writer
+sleep 1
+take_backup            # counts + dump must describe one instant despite the writer
+sleep 1
+stop_writer
+n_at_backup="$(awk -F'|' '$1=="public.telemetry_raw"{print $2}' "$WORK/rowcounts.pre")"
+n_now="$(q 'select count(*) from telemetry_raw')"
+check "the writer really was writing"  "$(( n_now > n_at_backup ))" "1"
+restore_db_swap "$WORK/db.dump" "$WORK/rowcounts.pre" full >/dev/null 2>&1 \
+  && ok "restore succeeded despite concurrent writes" || { warn "restore FAILED (the count/dump skew bug)"; (( ++FAIL )); }
+check "restored to the backup instant" "$(q 'select count(*) from telemetry_raw')" "$n_at_backup"
+
+# ---------------------------------------------------------------- case 6 --
+hdr "6. a second schema is verified too, not silently ignored"
+fresh_live
+psql_prod -q -c "CREATE SCHEMA health; CREATE TABLE health.anchors(id int); INSERT INTO health.anchors SELECT generate_series(1,7);"
+take_backup
+check "the extra schema is in the counts" \
+  "$(awk -F'|' '$1=="health.anchors"{print $2}' "$WORK/rowcounts.pre")" "7"
+psql_prod -q -c "INSERT INTO health.anchors VALUES (99)"
+restore_db_swap "$WORK/db.dump" "$WORK/rowcounts.pre" full >/dev/null 2>&1 \
+  && ok "restore succeeded" || { warn "restore FAILED"; (( ++FAIL )); }
+check "health.anchors rewound"  "$(q 'select count(*) from health.anchors')" "7"
+
+# ---------------------------------------------------------------- case 7 --
+hdr "7. empty row counts must refuse to swap (never verify nothing)"
+fresh_live
+take_backup
+: > "$WORK/rowcounts.pre"
+before="$(q 'select count(*) from users')"
+( restore_db_swap "$WORK/db.dump" "$WORK/rowcounts.pre" full ) >/dev/null 2>&1
+rc=$?
+check "aborted with non-zero exit"  "$(( rc != 0 ))" "1"
+check "live database untouched"     "$(q 'select count(*) from users')" "$before"
+
+# ---------------------------------------------------------------- case 8 --
+hdr "8. soft mode: telemetry for a vehicle removed by the revert"
+fresh_live
+psql_prod -q -c "CREATE TABLE vehicles(vin text primary key)"
+psql_prod -q -c "INSERT INTO vehicles VALUES ('VIN1')"
+psql_prod -q -c "ALTER TABLE telemetry_raw ADD COLUMN vin text REFERENCES vehicles(vin)"
+psql_prod -q -c "UPDATE telemetry_raw SET vin='VIN1'"
+dump_and_count_consistently "$WORK/db.dump" "$WORK/rowcounts.pre" soft >/dev/null 2>&1
+# a vehicle onboarded AFTER the backup, with telemetry of its own
+psql_prod -q -c "INSERT INTO vehicles VALUES ('VIN2')"
+psql_prod -q -c "INSERT INTO telemetry_raw (payload, vin) SELECT 'new'||i,'VIN2' FROM generate_series(1,5) i"
+psql_prod -q -c "INSERT INTO telemetry_raw (payload, vin) SELECT 'more'||i,'VIN1' FROM generate_series(1,5) i"
+restore_db_swap "$WORK/db.dump" "$WORK/rowcounts.pre" soft >/dev/null 2>&1 \
+  && ok "soft restore succeeded across a foreign key" || { warn "soft restore FAILED"; (( ++FAIL )); }
+check "VIN1 telemetry all carried over (105)"  "$(q "select count(*) from telemetry_raw where vin='VIN1'")" "105"
+check "VIN2 telemetry not resurrected"         "$(q "select count(*) from telemetry_raw where vin='VIN2'")" "0"
+check "VIN2 vehicle removed by the revert"     "$(q "select count(*) from vehicles where vin='VIN2'")" "0"
 
 # ------------------------------------------------------------------ done --
 hdr "$( (( FAIL )) && echo "${C_RED}selftest: $FAIL failed, $PASS passed${C_OFF}" || echo "${C_GRN}selftest: all $PASS checks passed${C_OFF}")"

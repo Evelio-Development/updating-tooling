@@ -22,6 +22,14 @@ done
 assert_root
 assert_prod_layout
 
+if [[ -f "$BREADCRUMB" ]]; then
+  hdr "${C_RED}A DATABASE SWAP DID NOT FINISH${C_OFF}"
+  cat "$BREADCRUMB"
+  log ""
+  log "update.sh and revert.sh refuse to run until this is resolved."
+  log ""
+fi
+
 hdr "Production"
 for u in "${BACKEND_SERVICES[@]}" "$INGEST_SERVICE" caddy; do
   printf '  %-22s %s\n' "$u" "$(systemctl is-active "$u" 2>/dev/null || echo '?')"
@@ -29,6 +37,12 @@ done
 printf '  %-22s %s\n' "database $PG_DB" "$(human "$(db_size_bytes "$PG_DB")")"
 printf '  %-22s %s\n' "webroot" "$(du -sh "$WEBROOT" 2>/dev/null | cut -f1)"
 printf '  %-22s %sGB free\n' "disk" "$(free_gb "$UPD_ROOT")"
+
+shopt -s nullglob
+for stray in "$RELEASES_DIR"/new.* "$RELEASES_DIR"/old.*; do
+  warn "leftover release staging dir: $stray ($(du -sh "$stray" 2>/dev/null | cut -f1))"
+done
+shopt -u nullglob
 
 hdr "Source clone"
 if [[ -d "$SRC_REPO/.git" ]]; then
@@ -48,7 +62,8 @@ if load_release_meta; then
   printf '  db dump   : %s %s\n' "${DB_DUMP_MODE:-none}" \
     "$( [[ -f "$RELEASE_DIR/db.dump" ]] && human "$(stat -c%s "$RELEASE_DIR/db.dump")" )"
   [[ "${SKIPPED_TESTS:-0}" == "1" ]] && warn "this release was deployed with --skip-tests"
-  [[ -n "${REVERTED_AT:-}" ]] && warn "already reverted at $REVERTED_AT (${REVERTED_MODE:-?}) — this backup has been consumed"
+  printf '  completed : %s\n' "$( [[ "${DEPLOY_COMPLETED:-0}" == "1" ]] && echo yes || echo "${C_YEL}NO — the deploy never verified${C_OFF}" )"
+  [[ -n "${REVERTED_AT:-}" ]] && warn "already reverted at $REVERTED_AT (${REVERTED_MODE:-?}) — reverting again needs --force"
 else
   warn "no backup — nothing to revert to. Run bin/adopt.sh, then bin/update.sh."
 fi
@@ -68,21 +83,45 @@ else
 fi
 
 hdr "Kept pre-revert databases"
-mapfile -t aside < <(psql_maint -tAc "select datname from pg_database where datname like 'evelio_prerevert_%' or datname like 'evelio_restore_%'")
+# Only evelio_prerevert_* is prunable. evelio_restore_* is the SCRATCH database
+# of a revert that may be running right now in another terminal — dropping it
+# mid-restore would kill that revert.
+mapfile -t aside < <(psql_maint -tAc "select datname from pg_database where datname like 'evelio_prerevert_%' order by datname" </dev/null)
+mapfile -t scratch < <(psql_maint -tAc "select datname from pg_database where datname like 'evelio_restore_%' order by datname" </dev/null)
+
 if (( ${#aside[@]} == 0 )) || [[ -z "${aside[0]:-}" ]]; then
-  ok "none"
+  ok "no pre-revert databases"
+  aside=()
 else
   for d in "${aside[@]}"; do printf '  %-34s %s\n' "$d" "$(human "$(db_size_bytes "$d")")"; done
-  if (( PRUNE )); then
+fi
+
+if (( ${#scratch[@]} )) && [[ -n "${scratch[0]:-}" ]]; then
+  log ""
+  warn "scratch restore database(s) present:"
+  for d in "${scratch[@]}"; do
+    busy="$(psql_maint -tAc "select count(*) from pg_stat_activity where datname='$d'" </dev/null || echo 0)"
+    printf '  %-34s %s  %s\n' "$d" "$(human "$(db_size_bytes "$d")")" \
+      "$( [[ "${busy:-0}" != "0" ]] && echo "${C_YEL}IN USE — a revert may be running${C_OFF}" || echo "(idle; leftover from an interrupted revert)" )"
+  done
+  log "  These are never pruned automatically. If no revert is running, drop them:"
+  log "    docker exec -i $PG_CONTAINER psql -U $PG_USER -d postgres -c 'DROP DATABASE \"<name>\" WITH (FORCE)'"
+fi
+
+if (( PRUNE )); then
+  if (( ${#aside[@]} == 0 )); then
+    ok "nothing to prune"
+  else
     log ""
-    warn "these are the ONLY copies of the data as it was just before a revert."
+    warn "these are the ONLY copies of the data as it was just before a revert:"
+    printf '    %s\n' "${aside[@]}"
     confirm "Dropping them is irreversible." "PRUNE" || die "aborted."
     for d in "${aside[@]}"; do
       info "dropping $d"; psql_maint -c "DROP DATABASE \"$d\" WITH (FORCE)" >/dev/null
     done
     ok "pruned"
-  else
-    log ""
-    log "  free the space with: sudo $0 --prune-aside"
   fi
+elif (( ${#aside[@]} )); then
+  log ""
+  log "  free the space with: sudo $0 --prune-aside"
 fi

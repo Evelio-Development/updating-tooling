@@ -171,15 +171,100 @@ db_size_bytes() { # $1 = dbname
   psql_maint -tAc "select pg_database_size('$1')" 2>/dev/null || echo 0
 }
 
+# SQL that builds a "schema.table|count" listing for every ordinary or
+# partitioned table in every non-system schema. `public` is not the only schema
+# here — prod also has `health` — and a table left out of this list is a table
+# the revert neither verifies nor warns you about.
+ROWCOUNT_ENUM_SQL="
+  select string_agg(
+           format('select %L::text t, count(*) c from %I.%I',
+                  n.nspname||'.'||c.relname, n.nspname, c.relname),
+           ' union all ' order by n.nspname, c.relname)
+  from pg_class c join pg_namespace n on n.oid=c.relnamespace
+  where n.nspname not in ('pg_catalog','information_schema')
+    and n.nspname not like 'pg_toast%'
+    and c.relkind in ('r','p')
+    and c.relpersistence = 'p'"
+
 # Row counts for every user table — the evidence a revert diff is built from.
 capture_rowcounts() {  # $1 = output file
-  local out="$1" sql
-  sql="select string_agg(format('select %L::text t, count(*) c from %I.%I', c.relname, n.nspname, c.relname), ' union all ')
-       from pg_class c join pg_namespace n on n.oid=c.relnamespace
-       where n.nspname='public' and c.relkind='r'"
-  local q; q="$(psql_prod -tAc "$sql")"
+  local out="$1" q
+  q="$(psql_prod -tAc "$ROWCOUNT_ENUM_SQL")"
   [[ -n "$q" ]] || die "could not enumerate tables for row counts"
-  psql_prod -tAF'|' -c "$q" | sort > "$out"
+  psql_prod -tAF'|' -c "$q" | sed '/^$/d' | sort > "$out"
+}
+
+# Row counts inside an arbitrary database (used to verify a restored side DB).
+rowcounts_of_db() {  # $1 = dbname, $2 = output file
+  local db="$1" out="$2" q
+  q="$(docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$db" -tAc "$ROWCOUNT_ENUM_SQL" </dev/null)"
+  [[ -n "$q" ]] || die "could not enumerate tables in $db"
+  docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$db" -tAF'|' -c "$q" </dev/null \
+    | sed '/^$/d' | sort > "$out"
+}
+
+# ---------------------------------------------------------------------------
+# Snapshot-consistent backup.
+#
+# The row counts and the dump MUST describe the same instant. Taking the counts
+# first and dumping afterwards (the obvious way) is wrong: production keeps
+# writing across the ~30s gap — telemetry alone arrives at ~220 rows/minute — so
+# the dump legitimately contains MORE rows than the counts. The restore then
+# fails its own verification and the backup becomes un-restorable through the
+# tool, while blaming the dump. That is a total failure of the one promise this
+# tool makes, so it is worth the coprocess below.
+#
+# Fix: open a REPEATABLE READ transaction, export its snapshot, count inside it,
+# and hand the same snapshot to pg_dump. Both then see one identical instant.
+# ---------------------------------------------------------------------------
+dump_and_count_consistently() {  # $1 = dump out, $2 = counts out, $3 = full|soft
+  local dumpout="$1" countout="$2" mode="$3"
+  local snapid="" line
+
+  info "opening a consistent snapshot (counts and dump will describe one instant)"
+  coproc SNAP { docker exec -i "$PG_CONTAINER" \
+                  psql -U "$PG_USER" -d "$PG_DB" -qtAX -v ON_ERROR_STOP=1 2>&1; }
+
+  # Keep this session open for the whole dump: the snapshot dies with it.
+  printf 'BEGIN ISOLATION LEVEL REPEATABLE READ;\nSELECT pg_export_snapshot();\n' >&"${SNAP[1]}"
+  if ! read -r -t 60 snapid <&"${SNAP[0]}" || [[ -z "$snapid" || "$snapid" == ERROR* ]]; then
+    exec {SNAP[1]}>&- 2>/dev/null || true
+    die "could not export a database snapshot (got '${snapid:-nothing}') — nothing changed."
+  fi
+  ok "snapshot $snapid"
+
+  local rc=0
+  if [[ "$mode" == soft ]]; then
+    docker exec "$PG_CONTAINER" pg_dump -U "$PG_USER" -d "$PG_DB" -Fc -Z1 \
+      --snapshot="$snapid" --exclude-table-data=public.telemetry_raw \
+      </dev/null > "$dumpout" || rc=$?
+  else
+    docker exec "$PG_CONTAINER" pg_dump -U "$PG_USER" -d "$PG_DB" -Fc -Z1 \
+      --snapshot="$snapid" </dev/null > "$dumpout" || rc=$?
+  fi
+  if (( rc )); then
+    exec {SNAP[1]}>&- 2>/dev/null || true
+    die "pg_dump failed (rc=$rc) — production NOT modified."
+  fi
+
+  # Count inside the SAME transaction, so the numbers match the dump exactly.
+  local q
+  q="$(psql_prod -tAc "$ROWCOUNT_ENUM_SQL")"
+  [[ -n "$q" ]] || { exec {SNAP[1]}>&- 2>/dev/null || true; die "could not enumerate tables"; }
+  printf '%s;\n\\echo __COUNTS_END__\n' "$q" >&"${SNAP[1]}"
+
+  : > "$countout"
+  while read -r -t 300 line <&"${SNAP[0]}"; do
+    [[ "$line" == "__COUNTS_END__" ]] && break
+    [[ -z "$line" ]] && continue
+    printf '%s\n' "$line" >> "$countout"
+  done
+  printf 'COMMIT;\n\\q\n' >&"${SNAP[1]}"
+  exec {SNAP[1]}>&- 2>/dev/null || true
+  wait "$SNAP_PID" 2>/dev/null || true
+
+  sort -o "$countout" "$countout"
+  [[ -s "$countout" ]] || die "captured zero row counts — refusing to store a backup we cannot verify."
 }
 
 # ------------------------------------------------------------------- disk --
@@ -191,6 +276,93 @@ assert_disk_for() {  # $1 = needed GB, $2 = path
   (( avail >= need + DISK_MARGIN_GB )) \
     || die "not enough disk on $path: ${avail}GB free, need ${need}GB + ${DISK_MARGIN_GB}GB margin.
        A full disk breaks Postgres — i.e. it breaks production. Free space first."
+}
+
+# ------------------------------------------------------------------- lock --
+# One deploy/revert at a time. Without this, "I wasn't sure it finished, let me
+# run it again" turns into two runs interleaving migrations, clobbering each
+# other's dump, and — worst — the second run destroying the backup the first
+# one is relying on for its rollback.
+take_lock() {  # $1 = what we are doing (for the message)
+  mkdir -p "$UPD_ROOT"
+  exec 9>"$UPD_ROOT/.lock"
+  if ! flock -n 9; then
+    die "another update/revert is already running (holder of $UPD_ROOT/.lock).
+       Wait for it to finish. If you are certain it is dead:
+         fuser -k $UPD_ROOT/.lock    # then re-run"
+  fi
+  printf '%s %s pid=%s\n' "$(date -u +%FT%TZ)" "${1:-run}" "$$" >&9
+}
+
+# ------------------------------------------------------------- breadcrumb --
+# Written around genuinely non-atomic, non-resumable moments (the database
+# swap). If the machine dies mid-swap, this file is the only thing on disk that
+# says what happened and how to finish it by hand.
+BREADCRUMB="${BREADCRUMB:-$UPD_ROOT/.swap-in-progress}"
+
+breadcrumb_write() { mkdir -p "$UPD_ROOT"; cat > "$BREADCRUMB"; }
+breadcrumb_clear() { rm -f "$BREADCRUMB"; }
+
+assert_no_breadcrumb() {
+  [[ -f "$BREADCRUMB" ]] || return 0
+  hdr "AN EARLIER DATABASE SWAP DID NOT FINISH"
+  cat "$BREADCRUMB"
+  log ""
+  die "refusing to run while $BREADCRUMB exists.
+       Follow the recovery command above, verify the database, then delete that
+       file. Running anything else first risks compounding the problem."
+}
+
+# ------------------------------------------------------------------- cron --
+# Root's crontab runs three jobs that connect to the prod DB and two that
+# execute code straight out of $BACKEND_DIR (fetch_odometer.py every 15 min,
+# run_outage_check.sh every 15 min, run_notifier.sh hourly). Stopping the
+# services is therefore NOT enough to make the run-dir or the database quiet.
+CRON_WAS_ACTIVE=0
+pause_cron() {
+  if systemctl is-active --quiet cron 2>/dev/null; then
+    CRON_WAS_ACTIVE=1
+    info "stopping cron (its jobs run code from $BACKEND_DIR and write to $PG_DB)"
+    systemctl stop cron || warn "could not stop cron — jobs may run mid-deploy"
+  fi
+}
+resume_cron() {
+  (( CRON_WAS_ACTIVE )) || return 0
+  systemctl start cron || warn "could not restart cron — START IT BY HAND: systemctl start cron"
+  CRON_WAS_ACTIVE=0
+}
+
+# --------------------------------------------------------------- webroot --
+# Restore $WEBROOT from a snapshot tarball.
+#
+# `legal/` holds published agreement PDFs. Some versions are tracked in the app
+# repo (frontend/public/legal) and some are published by hand and exist nowhere
+# else — so a plain `rsync --delete` from an older snapshot DELETES any PDF
+# published since. Those documents are legally operative; losing one is not an
+# acceptable cost of a code rollback. They are therefore merged, never deleted.
+restore_webroot() {  # $1 = tarball
+  local tgz="$1" tmp
+  [[ -f "$tgz" ]] || { warn "no webroot snapshot at $tgz — leaving $WEBROOT alone"; return 1; }
+  tar -tzf "$tgz" >/dev/null 2>&1 || { warn "webroot snapshot is unreadable — leaving $WEBROOT alone"; return 1; }
+  tmp="$(mktemp -d)"
+  tar -C "$tmp" -xzf "$tgz" || { rm -rf "$tmp"; warn "could not extract the webroot snapshot"; return 1; }
+  [[ -n "$(ls -A "$tmp")" ]] || { rm -rf "$tmp"; warn "webroot snapshot is empty — refusing to wipe $WEBROOT"; return 1; }
+  rsync -a --delete --filter='P legal/***' "$tmp/" "$WEBROOT/"
+  chmod -R a+rX "$WEBROOT"
+  rm -rf "$tmp"
+  return 0
+}
+
+# What `restore_webroot` would delete — shown in revert.sh's dry run so the
+# operator sees it before, not after.
+webroot_deletions() {  # $1 = tarball
+  local tgz="$1" tmp
+  tar -tzf "$tgz" >/dev/null 2>&1 || return 0
+  tmp="$(mktemp -d)"
+  tar -C "$tmp" -xzf "$tgz" 2>/dev/null || { rm -rf "$tmp"; return 0; }
+  rsync -a --delete --filter='P legal/***' --dry-run --out-format='%o %n' "$tmp/" "$WEBROOT/" 2>/dev/null \
+    | awk '$1=="del."{print "  " $2}'
+  rm -rf "$tmp"
 }
 
 # --------------------------------------------------------------- services --
