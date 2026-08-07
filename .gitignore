@@ -1,0 +1,9 @@
+# Never commit anything with a real value in it.
+frontend-build.env
+*.env
+!frontend-build.env.template
+*.dump
+releases/
+logs/
+src/
+.testvenv/

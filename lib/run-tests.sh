@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+#
+# run-tests.sh <repo-dir> — run the app's test suite as a pre-deploy gate.
+#
+# Two things matter here, and both are safety, not convenience:
+#
+#  1. The tests run against a THROWAWAY database inside the *staging* Postgres
+#     container (:5433), never prod.
+#  2. Several app modules default to PG_PORT=5432 / PG_DB=evelio (i.e. PROD)
+#     when their vars are unset. So the test venv gets a `.pth` guard that wraps
+#     psycopg2.connect and refuses port 5432, the shared `evelio` database, and
+#     any non-local host — the same control the staging tooling installs. Env
+#     vars alone are not a boundary; a module that ignores them would reach prod.
+#
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=./common.sh
+source "$HERE/lib/common.sh"
+
+REPO="${1:?usage: run-tests.sh <repo-dir>}"
+[[ -d "$REPO" ]] || die "no such repo dir: $REPO"
+
+docker inspect "$STAGING_PG_CONTAINER" >/dev/null 2>&1 \
+  || die "staging postgres container '$STAGING_PG_CONTAINER' not found.
+       The test gate refuses to fall back to the prod container. Start staging,
+       or deploy with --skip-tests."
+
+TESTDB="evelio_pretest_$(date -u +%Y%m%d%H%M%S)"
+spg() { docker exec -i "$STAGING_PG_CONTAINER" psql -U evelio -d "${1:-postgres}" -v ON_ERROR_STOP=1 "${@:2}"; }
+
+cleanup() {
+  docker exec -i "$STAGING_PG_CONTAINER" psql -U evelio -d postgres \
+    -c "DROP DATABASE IF EXISTS \"$TESTDB\" WITH (FORCE)" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+info "creating throwaway test db $TESTDB in $STAGING_PG_CONTAINER"
+spg postgres -c "CREATE DATABASE \"$TESTDB\" OWNER evelio" >/dev/null
+
+# Schema for the tests = the branch's own migrations (idempotent by convention).
+shopt -s nullglob
+for m in "$REPO"/migrate_*.sql; do
+  spg "$TESTDB" < "$m" >/dev/null 2>&1 || warn "migration $(basename "$m") did not apply cleanly to the test db"
+done
+shopt -u nullglob
+
+# ------------------------------------------------------------- test venv --
+PROD_SITE="$(ls -d "$BACKEND_DIR"/.venv/lib/python*/site-packages 2>/dev/null | head -1)"
+[[ -n "$PROD_SITE" ]] || die "cannot locate the prod venv's site-packages under $BACKEND_DIR/.venv"
+
+if [[ ! -x "$TESTVENV/bin/python" ]]; then
+  info "creating test venv"
+  python3 -m venv "$TESTVENV" || die "could not create the test venv"
+fi
+
+SITE="$(ls -d "$TESTVENV"/lib/python*/site-packages 2>/dev/null | head -1)"
+[[ -n "$SITE" ]] || die "test venv has no site-packages"
+
+# Reuse the prod venv's libraries (fastapi, psycopg2, …) READ-ONLY by putting its
+# site-packages on the path. A venv created *from* the prod venv would not
+# inherit them (--system-site-packages means the *system* interpreter's), and
+# pip-installing into the prod venv is not something a deploy tool may do.
+# Sorts before the guard below, which needs psycopg2 importable.
+printf '%s\n' "$PROD_SITE" > "$SITE/za-prod-site.pth"
+
+# Prod-connection guard. Must be a .pth: Debian ships
+# /usr/lib/python3/sitecustomize.py which shadows a venv-local sitecustomize.py.
+PTH="$SITE/zz-evelio-prod-guard.pth"
+cat > "$PTH" <<'PYEOF'
+import sys, os
+def _guard():
+    try:
+        import psycopg2
+    except Exception:
+        return
+    _real = psycopg2.connect
+    def connect(*a, **kw):
+        port = str(kw.get("port") or os.environ.get("PG_PORT") or "5432")
+        db   = kw.get("dbname") or kw.get("database") or os.environ.get("PG_DB") or "evelio"
+        host = str(kw.get("host") or os.environ.get("PG_HOST") or "localhost")
+        if str(port) == "5432" or db == "evelio" or host not in ("localhost", "127.0.0.1", "::1"):
+            sys.stderr.write(
+                "\n*** BLOCKED: the pre-deploy test suite tried to connect to "
+                "port=%s db=%s host=%s.\n*** That is the PRODUCTION database. "
+                "Tests never talk to prod.\n\n" % (port, db, host))
+            raise SystemExit(3)
+        return _real(*a, **kw)
+    psycopg2.connect = connect
+_guard()
+PYEOF
+
+"$TESTVENV/bin/python" -c 'import pytest' 2>/dev/null \
+  || { info "installing pytest into the test venv"; "$TESTVENV/bin/pip" install -q pytest || die "could not install pytest"; }
+
+# ---------------------------------------------------------------- run it --
+# ONE PROCESS PER TEST FILE. The suite's modules stub each other in sys.modules
+# (several inject fake `auth`/`agreement` modules), so a single pytest process
+# collecting all of them fails on pollution alone — files that pass perfectly
+# well in isolation. Do not "optimise" this back into one invocation: it would
+# turn the gate into a permanent false alarm, and a gate everyone bypasses with
+# --skip-tests protects nothing.
+shopt -s nullglob
+TESTS=( "$REPO"/test_*.py )
+shopt -u nullglob
+(( ${#TESTS[@]} )) || { warn "no test files found"; exit 0; }
+
+info "pytest — ${#TESTS[@]} test file(s), one process each"
+failed=()
+for t in "${TESTS[@]}"; do
+  name="$(basename "$t")"
+  if ( cd "$REPO" && \
+       PG_HOST=127.0.0.1 PG_PORT=5433 PG_DB="$TESTDB" PG_USER=evelio PG_PASS="${STAGING_PG_PASS:-evelio}" \
+       PGHOST=127.0.0.1 PGPORT=5433 PGDATABASE="$TESTDB" PGUSER=evelio \
+       JWT_SECRET=pretest-not-a-real-secret \
+       TESLA_ENV_FILE=/dev/null TESLA_TOKEN_DIR="$UPD_ROOT/.testtokens" \
+       "$TESTVENV/bin/python" -m pytest -q "$name" >"$LOG_DIR/test-$name.log" 2>&1 )
+  then
+    printf '  %-46s %sPASS%s\n' "$name" "$C_GRN" "$C_OFF"
+  else
+    printf '  %-46s %sFAIL%s\n' "$name" "$C_RED" "$C_OFF"
+    failed+=("$name")
+  fi
+done
+
+# The caller decides what a failure MEANS (see update.sh: it is a regression
+# gate, not a pass/fail gate — much of this suite has been red for a while).
+printf '%s\n' "${failed[@]}" | sed '/^$/d' | sort > "${RESULTS_FILE:-/dev/null}"
+
+if (( ${#failed[@]} )); then
+  warn "${#failed[@]}/${#TESTS[@]} test file(s) failed (logs in $LOG_DIR/test-*.log)"
+  exit 1
+fi
+ok "all ${#TESTS[@]} test file(s) passed"
+exit 0
