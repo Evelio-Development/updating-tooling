@@ -61,7 +61,9 @@ if load_release_meta; then
   printf '  reverts to: %s\n' "${PREV_COMMIT:-unknown}"
   printf '  db dump   : %s %s\n' "${DB_DUMP_MODE:-none}" \
     "$( [[ -f "$RELEASE_DIR/db.dump" ]] && human "$(stat -c%s "$RELEASE_DIR/db.dump")" )"
-  [[ "${SKIPPED_TESTS:-0}" == "1" ]] && warn "this release was deployed with --skip-tests"
+  # No SKIPPED_TESTS field is written any more: --skip-tests was removed, so a
+  # release can only exist if the gate passed. Reporting a state the tool cannot
+  # produce is worse than reporting nothing.
   printf '  completed : %s\n' "$( [[ "${DEPLOY_COMPLETED:-0}" == "1" ]] && echo yes || echo "${C_YEL}NO — the deploy never verified${C_OFF}" )"
   [[ -n "${REVERTED_AT:-}" ]] && warn "already reverted at $REVERTED_AT (${REVERTED_MODE:-?}) — reverting again needs --force"
 else
@@ -109,17 +111,41 @@ if (( ${#scratch[@]} )) && [[ -n "${scratch[0]:-}" ]]; then
 fi
 
 if (( PRUNE )); then
+  # An evelio_prerevert_* database is not always "the old copy": between the two
+  # renames of a swap, and after any crash in that window, it IS production's
+  # only data and no database named evelio exists. Pruning then destroys prod
+  # irrecoverably — and the prompt's own wording ("the ONLY copies") reads as
+  # reassurance while describing exactly that. So: refuse while a swap is
+  # unresolved, refuse if the live database is missing, take the lock so a revert
+  # running in another terminal cannot have its aside copy pulled out from under
+  # it, and skip any candidate that still has sessions on it.
+  assert_no_breadcrumb
+  take_lock "prune-aside"
+  db_exists "$PG_DB" \
+    || die "there is no database named '$PG_DB'. One of the databases below is
+       therefore production's live data, not a spare copy. Refusing to prune.
+       Rename the right one back into place first (see bin/revert.sh output)."
   if (( ${#aside[@]} == 0 )); then
     ok "nothing to prune"
   else
-    log ""
-    warn "these are the ONLY copies of the data as it was just before a revert:"
-    printf '    %s\n' "${aside[@]}"
-    confirm "Dropping them is irreversible." "PRUNE" || die "aborted."
+    keep=(); drop=()
     for d in "${aside[@]}"; do
-      info "dropping $d"; psql_maint -c "DROP DATABASE \"$d\" WITH (FORCE)" >/dev/null
+      busy="$(psql_maint -tAc "select count(*) from pg_stat_activity where datname='$d'" </dev/null || echo 1)"
+      if [[ "${busy:-1}" != "0" ]]; then keep+=("$d"); else drop+=("$d"); fi
     done
-    ok "pruned"
+    (( ${#keep[@]} )) && warn "skipping (sessions still attached — a revert may be running): ${keep[*]}"
+    if (( ${#drop[@]} == 0 )); then
+      ok "nothing prunable"
+    else
+      log ""
+      warn "these are the ONLY copies of the data as it was just before a revert:"
+      printf '    %s\n' "${drop[@]}"
+      confirm "Dropping them is irreversible." "PRUNE" || die "aborted."
+      for d in "${drop[@]}"; do
+        info "dropping $d"; psql_maint -c "DROP DATABASE \"$d\" WITH (FORCE)" >/dev/null
+      done
+      ok "pruned"
+    fi
   fi
 elif (( ${#aside[@]} )); then
   log ""

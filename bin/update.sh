@@ -52,6 +52,7 @@ STEP="init"
 STARTED_AT=""          # set just before the first prod mutation
 FIRST_MUTATION=0       # 1 once production has been touched
 INTERRUPTED=0
+DEPLOY_TMP=""          # in-flight *.deploying.$$ staging file, cleared on failure
 NEW_REL="$RELEASES_DIR/new.$$"
 
 hdr "Evelio production update"
@@ -244,7 +245,12 @@ log "  changing        : ${#CHANGED[@]} file(s)"
 
 # Files the last deploy installed that main no longer has: they are removed
 # from production, and they ARE in the backup (see the union snapshot below).
-mapfile -t PREV_LIST < <(awk '{print $2}' "$RELEASE_DIR/MANIFEST" | sort -u)
+# sha_dir_manifest writes "<sha>  <rel>". `awk '{print $2}'` truncates any path
+# containing a space at the first one, which would drop it from REMOVING, from the
+# union snapshot and from FILES.prev — a deleted-in-main file with a space would
+# then be neither backed up nor removed, and the truncated stem would reach
+# `rm -f "$BACKEND_DIR/$rel"`. Strip exactly the "<sha><two spaces>" prefix.
+mapfile -t PREV_LIST < <(sed 's/^[^ ]*  //' "$RELEASE_DIR/MANIFEST" | sed '/^$/d' | sort -u)
 REMOVING=()
 for rel in "${PREV_LIST[@]}"; do
   [[ -n "$rel" ]] || continue
@@ -301,6 +307,13 @@ hdr "4. Backup (production not yet modified)"
 STEP="backup"
 rm -rf "$NEW_REL"
 mkdir -p "$NEW_REL"/{backend,frontend,ingest,caddy}
+# A release dir holds a full pg_dump of production — user PII, password hashes,
+# and every token/credential column — plus a tar of the webroot. Under the default
+# 0022 umask those land mode 644 inside a 755 tree, i.e. readable by every local
+# account. Tighten the release tree and the log dir explicitly rather than relying
+# on whatever umask the operator's shell happened to have.
+chmod 700 "$RELEASES_DIR" "$LOG_DIR" 2>/dev/null || true
+chmod -R go-rwx "$NEW_REL"
 REL_ID="$(now_id)"
 
 # Snapshot the UNION of "what this deploy installs" and "what the last deploy
@@ -330,6 +343,10 @@ fi
 
 if (( SOFT_DB )); then DUMP_MODE=soft; else DUMP_MODE=full; fi
 info "pg_dump ($DUMP_MODE) — this is the one that matters; do not interrupt it"
+# Create the dump mode 600 BEFORE any data goes into it — chmod'ing afterwards
+# leaves a window where the whole production database is world-readable.
+install -m 600 /dev/null "$NEW_REL/db.dump"
+install -m 600 /dev/null "$NEW_REL/rowcounts.pre"
 dump_and_count_consistently "$NEW_REL/db.dump" "$NEW_REL/rowcounts.pre" "$DUMP_MODE"
 ok "dump $(human "$(stat -c%s "$NEW_REL/db.dump")"), $(wc -l < "$NEW_REL/rowcounts.pre") tables counted in the same snapshot"
 
@@ -341,6 +358,12 @@ ok "dump verified"
 printf '%s\n' "${FILES[@]}"     > "$NEW_REL/FILES.new"
 printf '%s\n' "${PREV_LIST[@]}" > "$NEW_REL/FILES.prev"
 cp -a "$RELEASE_DIR/MANIFEST" "$NEW_REL/MANIFEST"   # rewritten after the copy
+# Keep the PRE-deploy fingerprint under its own name. MANIFEST is overwritten with
+# the post-deploy hashes later in this run, which used to destroy the only record
+# of which files existed before the deploy — the evidence revert.sh needs to tell
+# "this file did not exist pre-deploy, remove it" apart from "the snapshot is
+# incomplete, do NOT remove production's copy".
+cp -a "$RELEASE_DIR/MANIFEST" "$NEW_REL/MANIFEST.pre"
 
 cat > "$NEW_REL/meta.env" <<EOF
 RELEASE_ID=$REL_ID
@@ -362,11 +385,19 @@ EOF
 
 # Swap by two renames within one filesystem, so a complete release always
 # exists: `rm -rf current; mv new current` would have a window with no backup.
+OLD_REL="$RELEASES_DIR/old.$$"
+# A leftover old.<same-pid> (PID reuse after a crash in this exact window) would
+# make `mv` NEST the previous backup inside it and still report success — the
+# following rm -rf would then delete both. Refuse instead of guessing.
+[[ -e "$OLD_REL" ]] && die "a leftover staging dir $OLD_REL already exists.
+       Confirm releases/current is the backup you want, remove $OLD_REL, re-run."
 if [[ -d "$RELEASE_DIR" ]]; then
-  mv "$RELEASE_DIR" "$RELEASES_DIR/old.$$" || die "could not move the previous backup aside"
+  mv "$RELEASE_DIR" "$OLD_REL" || die "could not move the previous backup aside"
 fi
 mv "$NEW_REL" "$RELEASE_DIR" || die "could not install the new backup"
-rm -rf "$RELEASES_DIR/old.$$"
+rm -rf "$OLD_REL"
+# The release holds the dump and a webroot tar; keep the whole tree off-limits.
+chmod -R go-rwx "$RELEASE_DIR" 2>/dev/null || true
 ok "backup complete: $RELEASE_DIR ($REL_ID)"
 
 # =================================================== 5. ROLLBACK MACHINERY ==
@@ -410,8 +441,12 @@ rollback_code() {
   # and refuses.
   mapfile -t _rb < <(cat "$RELEASE_DIR/FILES.new" "$RELEASE_DIR/FILES.prev" 2>/dev/null | sed '/^$/d' | sort -u)
   sha_dir_manifest "$BACKEND_DIR" "${_rb[@]}" > "$RELEASE_DIR/MANIFEST"
-  [[ -f "$INGEST_DIR/fetch_odometer.py" ]] \
-    && sha_dir_manifest "$INGEST_DIR" fetch_odometer.py > "$RELEASE_DIR/MANIFEST.ingest"
+  # Same superset as the deploy path, or the rollback reads as drift next time.
+  _rbi=()
+  for _f in fetch_odometer.py ingest_from_dockerlogs.py; do
+    [[ -f "$INGEST_DIR/$_f" ]] && _rbi+=("$_f")
+  done
+  (( ${#_rbi[@]} )) && sha_dir_manifest "$INGEST_DIR" "${_rbi[@]}" > "$RELEASE_DIR/MANIFEST.ingest"
 
   systemctl restart "${BACKEND_SERVICES[@]}" || true
   resume_cron
@@ -433,6 +468,8 @@ on_failure() {
   (( rc == 0 )) && return 0
   set +e
   trap - EXIT
+  # Never leave a half-written staging file in the live run-dir.
+  [[ -n "${DEPLOY_TMP:-}" ]] && rm -f "$DEPLOY_TMP"
   hdr "${C_RED}DEPLOY FAILED at step: $STEP${C_OFF}"
   (( INTERRUPTED )) && warn "interrupted by a signal (Ctrl-C, SIGTERM or a dropped SSH session)"
 
@@ -453,7 +490,13 @@ on_failure() {
 
   local choice=1
   if [[ -t 0 ]]; then
+    # The EXIT trap is already cleared, so a Ctrl-C during this 300s prompt would
+    # otherwise exit straight out with production mutated and NOTHING rolled back.
+    # An interrupt at a rollback prompt means "get on with the safe option", not
+    # "abandon production half-deployed".
+    trap 'warn "interrupted at the prompt — taking option 1 (code-only rollback)."' INT TERM HUP
     read -r -t "$ROLLBACK_PROMPT_TIMEOUT" -p "choice [1/2/3] (default 1): " choice || choice=1
+    trap '' INT TERM HUP
     [[ -n "${choice:-}" ]] || choice=1
   else
     warn "not a terminal — taking option 1."
@@ -465,7 +508,10 @@ on_failure() {
       log ""
       warn "handing over to revert.sh for the database restore."
       # NOT exec: the deploy failed, and this process must still exit non-zero.
-      flock -u 9 2>/dev/null || true
+      # CLOSE fd 9, don't just `flock -u` it: leaving it open meant the child's own
+      # `exec 9<>` re-truncated the lock file and, once the child exited, nothing
+      # held the lock at all while this process was still running.
+      exec 9>&- 2>/dev/null || true
       "$HERE/bin/revert.sh" --apply --db-only || warn "the database revert did not complete"
       ;;
     3)
@@ -514,12 +560,29 @@ VITE_API_BASE="$VITE_API_BASE" VITE_TURNSTILE_SITE_KEY="$VITE_TURNSTILE_SITE_KEY
 popd >/dev/null
 
 info "verifying the bundle"
-if ! grep -rqF "$VITE_API_BASE" "$SRC_REPO/frontend/dist/assets/" 2>/dev/null; then
+# Scan the WHOLE dist tree, not just dist/assets/. index.html, inlined scripts,
+# anything Vite emits at the top level and everything copied through from public/
+# are all published, so all of them have to be checked. And do NOT hide errors
+# with 2>/dev/null: a missing or renamed assets/ dir made the dev-host grep exit
+# non-zero, which read as "no dev host found" and silently PASSED the gate.
+DIST="$SRC_REPO/frontend/dist"
+[[ -d "$DIST" ]] || die "no build output at $DIST"
+if ! grep -rqF "$VITE_API_BASE" "$DIST"; then
   die "the built bundle does not contain the prod API base '$VITE_API_BASE' —
        publishing it would point production at the wrong backend."
 fi
-if grep -rqE 'dev\.app\.evelio\.net|localhost:8[0-9]{3}' "$SRC_REPO/frontend/dist/assets/" 2>/dev/null; then
+if grep -rqE 'dev\.app\.evelio\.net|localhost:8[0-9]{3}' "$DIST"; then
   die "the built bundle references a dev/staging host — refusing to publish it to prod."
+fi
+# The 1x/2x/3x testing-sitekey check is applied to frontend-build.env during
+# pre-flight, but that only proves what we PASSED to the build. If the app repo
+# ships its own frontend/.env*, or reads a differently-named variable, a testing
+# sitekey reaches production while the gate says "bundle verified". Check the
+# artifact, which is the thing that actually gets published.
+if grep -rqE '"[123]x[A-Za-z0-9_-]{10,}"' "$DIST"; then
+  die "the built bundle contains a Cloudflare TESTING Turnstile sitekey (1x/2x/3x…).
+       That key always passes validation — publishing it disables the bot check on
+       production. Check frontend/.env* in the app repo, not just frontend-build.env."
 fi
 ok "bundle verified"
 
@@ -554,10 +617,21 @@ for f in "${FILES[@]}"; do
   mkdir -p "$BACKEND_DIR/$(dirname "$f")"
   # normalize CRLF: a Windows checkout breaks #! lines
   tmpf="$BACKEND_DIR/$f.deploying.$$"
+  DEPLOY_TMP="$tmpf"     # so the EXIT/signal path can clear it — see below
   sed 's/\r$//' "$SRC_REPO/$f" > "$tmpf" || { rm -f "$tmpf"; die "could not write $f"; }
   chmod --reference="$SRC_REPO/$f" "$tmpf" 2>/dev/null || true
   mv -f "$tmpf" "$BACKEND_DIR/$f"
+  DEPLOY_TMP=""
 done
+# An interrupt between the sed and the mv leaves <name>.deploying.<pid> in the live
+# run-dir. It matches no PROTECTED_GLOBS entry, so it is not protected, and adopt.sh
+# would later present it to a human as a mystery file "unknown to git".
+shopt -s nullglob
+for stray in "$BACKEND_DIR"/*.deploying.*; do
+  warn "removing leftover staging file from an interrupted deploy: $stray"
+  rm -f "$stray"
+done
+shopt -u nullglob
 # Remove code that main deleted — safe, because the union snapshot above has it.
 for rel in "${PREV_LIST[@]}"; do
   [[ -n "$rel" ]] || continue
@@ -579,14 +653,25 @@ hdr "9. Odometer script"
 STEP="deploy/ingest"
 if [[ -f "$SRC_REPO/fetch_odometer.py" ]]; then
   sed 's/\r$//' "$SRC_REPO/fetch_odometer.py" > "$INGEST_DIR/fetch_odometer.py"
-  sha_dir_manifest "$INGEST_DIR" fetch_odometer.py > "$RELEASE_DIR/MANIFEST.ingest"
   ok "fetch_odometer.py -> $INGEST_DIR (next cron run picks it up)"
+  # MANIFEST.ingest is written once, below, covering every deployed ingest file.
 fi
 if (( WITH_INGEST_DAEMON )) && [[ -f "$SRC_REPO/ingest_from_dockerlogs.py" ]]; then
   sed 's/\r$//' "$SRC_REPO/ingest_from_dockerlogs.py" > "$INGEST_DIR/ingest_from_dockerlogs.py"
   chmod +x "$INGEST_DIR/ingest_from_dockerlogs.py"
   systemctl restart "$INGEST_SERVICE"
   ok "ingest_from_dockerlogs.py deployed, $INGEST_SERVICE restarted"
+fi
+# Fingerprint every ingest file this tool actually deploys, not just the odometer
+# script: MANIFEST.ingest used to record fetch_odometer.py alone, so a hand-fix in
+# ingest_from_dockerlogs.py passed the drift gate and was silently overwritten by
+# the next --with-ingest-daemon deploy.
+_ingest_tracked=()
+for f in fetch_odometer.py ingest_from_dockerlogs.py; do
+  [[ -f "$INGEST_DIR/$f" ]] && _ingest_tracked+=("$f")
+done
+if (( ${#_ingest_tracked[@]} )); then
+  sha_dir_manifest "$INGEST_DIR" "${_ingest_tracked[@]}" > "$RELEASE_DIR/MANIFEST.ingest"
 fi
 
 hdr "10. Frontend publish"
@@ -606,16 +691,38 @@ if [[ -d "$NEWDIR/legal" && -d "$WEBROOT/legal" ]]; then
 elif [[ -d "$WEBROOT/legal" ]]; then
   cp -r "$WEBROOT/legal" "$NEWDIR/legal"
 fi
-OLDDIR="$WEBROOT/.retired.$$"
-mkdir -p "$OLDDIR"
-shopt -s dotglob
-for entry in "$WEBROOT"/*; do
-  case "$(basename "$entry")" in .publish.*|.retired.*) continue ;; esac
-  mv "$entry" "$OLDDIR/" 2>/dev/null || true
-done
-for entry in "$NEWDIR"/*; do mv "$entry" "$WEBROOT/" 2>/dev/null || true; done
-shopt -u dotglob
-rm -rf "$NEWDIR" "$OLDDIR"
+# Publish with ONE rsync pass rather than "move the live tree aside, then move the
+# new one in". That two-loop swap had a window between the loops where $WEBROOT
+# held no index.html and no assets/ at all — the site 404s, and if the process
+# died there production stayed empty with its only content in .retired.$$. It also
+# discarded every mv error (2>/dev/null || true) and then rm -rf'd the retired
+# copy unconditionally: a single failed rename (EACCES/EBUSY, or assets/ nesting
+# into assets/assets/) deleted the live webroot, hand-published legal/ PDFs
+# included. rsync replaces files in place and never empties the directory.
+#
+# legal/ is excluded from the transfer entirely: the published PDFs were merged
+# into $NEWDIR above with cp -rn, and `P` alone would let an older tracked PDF
+# overwrite a hand-republished one of the same name.
+[[ -s "$NEWDIR/index.html" ]] \
+  || die "staged frontend has no index.html — refusing to publish. $WEBROOT is untouched."
+rsync -a --delete \
+      --filter='P legal/***' --filter='- legal/***' \
+      --filter='P .publish.*' --filter='P .retired.*' \
+      "$NEWDIR/" "$WEBROOT/" \
+  || die "publishing the frontend failed — $WEBROOT may be partially updated.
+       Re-run, or restore with bin/revert.sh."
+[[ -s "$WEBROOT/index.html" && -d "$WEBROOT/assets" ]] \
+  || die "the published webroot has no index.html or no assets/ — production may be
+       serving nothing. Restore with bin/revert.sh."
+# legal/ was held out of the pass above, so publish the repo's tracked PDFs in a
+# second, ADD-ONLY pass: --ignore-existing installs a genuinely new agreement
+# version but never replaces a published file, and nothing here deletes.
+if [[ -d "$NEWDIR/legal" ]]; then
+  mkdir -p "$WEBROOT/legal"
+  rsync -a --ignore-existing "$NEWDIR/legal/" "$WEBROOT/legal/" \
+    || warn "could not publish tracked legal/ PDFs — check $WEBROOT/legal by hand"
+fi
+rm -rf "$NEWDIR"
 chmod -R a+rX "$WEBROOT"
 ok "published to $WEBROOT (legal/ preserved)"
 
@@ -623,10 +730,16 @@ if (( WITH_CADDY )); then
   hdr "11. Caddy"
   STEP="deploy/caddy"
   if [[ -f "$SRC_REPO/server-config/Caddyfile" ]] && ! cmp -s "$SRC_REPO/server-config/Caddyfile" "$CADDYFILE"; then
+    # Validate the SOURCE before installing it. Installing first and validating
+    # after leaves an invalid file at $CADDYFILE when validation fails: the
+    # running Caddy keeps its in-memory config, so the failure looks contained,
+    # but the next reload, package upgrade or reboot takes TLS and the proxy down
+    # for production. Backup -> validate -> install -> reload.
+    caddy validate --config "$SRC_REPO/server-config/Caddyfile" --adapter caddyfile \
+      || die "new Caddyfile does NOT validate — nothing was installed and the running
+       config is untouched. Fix server-config/Caddyfile in the app repo."
     cp -a "$CADDYFILE" "$CADDYFILE.bak.$(now_id)"
     cp "$SRC_REPO/server-config/Caddyfile" "$CADDYFILE"
-    caddy validate --config "$CADDYFILE" --adapter caddyfile \
-      || die "new Caddyfile does NOT validate — the old config is still running; restore $CADDYFILE.bak.*"
     systemctl reload caddy || die "caddy reload failed"
     ok "Caddyfile updated, validated and reloaded"
   else

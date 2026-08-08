@@ -37,6 +37,13 @@ PG_CONTAINER="${PG_CONTAINER:-telemetry-postgres}"   # PROD container (:5432)
 PG_DB="${PG_DB:-evelio}"
 PG_USER="${PG_USER:-evelio}"
 STAGING_PG_CONTAINER="telemetry-postgres-staging"  # tests only, never prod
+# Password the test gate uses for the throwaway database in the STAGING container.
+# Never a prod credential. Override in the environment, or drop it in
+# $UPD_ROOT/staging-db.pass (mode 600, untracked) rather than editing this file.
+if [[ -z "${STAGING_PG_PASS:-}" && -r "$UPD_ROOT/staging-db.pass" ]]; then
+  STAGING_PG_PASS="$(head -1 "$UPD_ROOT/staging-db.pass")"
+fi
+STAGING_PG_PASS="${STAGING_PG_PASS:-evelio}"
 
 BACKEND_SERVICES=(tesla-oauth onboarding-worker)
 INGEST_SERVICE="telemetry-ingest"
@@ -253,12 +260,30 @@ dump_and_count_consistently() {  # $1 = dump out, $2 = counts out, $3 = full|sof
   [[ -n "$q" ]] || { exec {SNAP[1]}>&- 2>/dev/null || true; die "could not enumerate tables"; }
   printf '%s;\n\\echo __COUNTS_END__\n' "$q" >&"${SNAP[1]}"
 
+  # The sentinel is not decoration: stderr is merged into this stream (2>&1 above),
+  # so if the count query errors — a relation ROWCOUNT_ENUM_SQL enumerated but this
+  # session cannot read, say — ON_ERROR_STOP=1 kills psql, the sentinel never
+  # arrives, the loop ends on EOF, and `ERROR: …` text lands in rowcounts.pre.
+  # `-s` would pass and we would store a "verified" backup whose counts are error
+  # messages; every revert against it then aborts and blames the dump. Require the
+  # sentinel, and require every line to look like a count.
   : > "$countout"
+  local saw_end=0
   while read -r -t 300 line <&"${SNAP[0]}"; do
-    [[ "$line" == "__COUNTS_END__" ]] && break
+    [[ "$line" == "__COUNTS_END__" ]] && { saw_end=1; break; }
     [[ -z "$line" ]] && continue
+    [[ "$line" =~ ^[^|]+\|[0-9]+$ ]] || {
+      exec {SNAP[1]}>&- 2>/dev/null || true
+      die "unexpected output while counting rows: '$line'
+       Refusing to store a backup whose row counts cannot be trusted. Nothing changed."
+    }
     printf '%s\n' "$line" >> "$countout"
   done
+  (( saw_end )) || {
+    exec {SNAP[1]}>&- 2>/dev/null || true
+    die "the row-count query did not run to completion (no end marker).
+       Refusing to store a backup that could never be verified. Nothing changed."
+  }
   printf 'COMMIT;\n\\q\n' >&"${SNAP[1]}"
   exec {SNAP[1]}>&- 2>/dev/null || true
   wait "$SNAP_PID" 2>/dev/null || true
@@ -285,12 +310,18 @@ assert_disk_for() {  # $1 = needed GB, $2 = path
 # one is relying on for its rollback.
 take_lock() {  # $1 = what we are doing (for the message)
   mkdir -p "$UPD_ROOT"
-  exec 9>"$UPD_ROOT/.lock"
+  # `9>` truncates on OPEN, i.e. before flock tells us we lost — which wiped the
+  # holder's date/what/pid line, the very thing the message below tells the
+  # operator to act on. `9<>` opens read-write without truncating; we rewrite the
+  # record only once the lock is actually ours.
+  exec 9<>"$UPD_ROOT/.lock"
   if ! flock -n 9; then
-    die "another update/revert is already running (holder of $UPD_ROOT/.lock).
+    die "another update/revert is already running:
+         $(cat "$UPD_ROOT/.lock" 2>/dev/null || echo '(holder left no record)')
        Wait for it to finish. If you are certain it is dead:
          fuser -k $UPD_ROOT/.lock    # then re-run"
   fi
+  : >"$UPD_ROOT/.lock"
   printf '%s %s pid=%s\n' "$(date -u +%FT%TZ)" "${1:-run}" "$$" >&9
 }
 
@@ -347,7 +378,14 @@ restore_webroot() {  # $1 = tarball
   tmp="$(mktemp -d)"
   tar -C "$tmp" -xzf "$tgz" || { rm -rf "$tmp"; warn "could not extract the webroot snapshot"; return 1; }
   [[ -n "$(ls -A "$tmp")" ]] || { rm -rf "$tmp"; warn "webroot snapshot is empty — refusing to wipe $WEBROOT"; return 1; }
-  rsync -a --delete --filter='P legal/***' "$tmp/" "$WEBROOT/"
+  # `P` (protect) stops rsync DELETING a receiver-side file; it does NOT stop it
+  # being OVERWRITTEN when the sender has one of the same name. The snapshot is a
+  # tar of the whole webroot, so it contains legal/ — meaning a PDF republished by
+  # hand under a name that also existed at backup time (and the tracked
+  # *-1.0.pdf names are exactly the ones re-published in place) was rolled back to
+  # the snapshot's content. `- legal/***` excludes the directory from the transfer
+  # as well, which is what "preserved rather than reverted" actually requires.
+  rsync -a --delete --filter='P legal/***' --filter='- legal/***' "$tmp/" "$WEBROOT/"
   chmod -R a+rX "$WEBROOT"
   rm -rf "$tmp"
   return 0
@@ -360,7 +398,8 @@ webroot_deletions() {  # $1 = tarball
   tar -tzf "$tgz" >/dev/null 2>&1 || return 0
   tmp="$(mktemp -d)"
   tar -C "$tmp" -xzf "$tgz" 2>/dev/null || { rm -rf "$tmp"; return 0; }
-  rsync -a --delete --filter='P legal/***' --dry-run --out-format='%o %n' "$tmp/" "$WEBROOT/" 2>/dev/null \
+  rsync -a --delete --filter='P legal/***' --filter='- legal/***' \
+        --dry-run --out-format='%o %n' "$tmp/" "$WEBROOT/" 2>/dev/null \
     | awk '$1=="del."{print "  " $2}'
   rm -rf "$tmp"
 }
@@ -412,10 +451,13 @@ check_services_stayed_up() {
 
 check_http() {
   local bad=0 code
+  # These two are UNAUTHENTICATED health endpoints, so only 2xx means healthy. A
+  # 404 here means the route is gone or the wrong router is mounted — i.e. exactly
+  # the regression this gate exists to catch. (The lenient 401/403/404 reasoning
+  # applies to arbitrary API paths, not to a health probe.)
   for url in https://evelio.net/health https://app.evelio.net/api/v1/health; do
     code="$(curl -sS -o /dev/null -m 15 -w '%{http_code}' "$url" 2>/dev/null || echo 000)"
-    if [[ "$code" =~ ^(200|204|401|403|404)$ ]]; then
-      # 401/403/404 still prove the backend answered rather than the proxy erroring.
+    if [[ "$code" =~ ^(200|204)$ ]]; then
       ok "HTTP $url -> $code"
     else
       warn "HTTP $url -> $code"; bad=1

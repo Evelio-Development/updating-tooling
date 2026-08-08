@@ -200,6 +200,73 @@ check "VIN1 telemetry all carried over (105)"  "$(q "select count(*) from teleme
 check "VIN2 telemetry not resurrected"         "$(q "select count(*) from telemetry_raw where vin='VIN2'")" "0"
 check "VIN2 vehicle removed by the revert"     "$(q "select count(*) from vehicles where vin='VIN2'")" "0"
 
+# ---------------------------------------------------------------- case 9 --
+# NULL-vin telemetry. `vin IN (...)` is NULL — i.e. not selected — for a NULL vin,
+# and soft mode exempts telemetry_raw from row verification, so dropping these rows
+# used to be completely silent: the carry-over's own count check used the same
+# predicate and therefore agreed with itself. Case 8 sets vin on every row, so it
+# cannot catch this.
+hdr "9. soft mode: telemetry with a NULL vin must survive"
+fresh_live
+psql_prod -q -c "CREATE TABLE vehicles(vin text primary key)"
+psql_prod -q -c "INSERT INTO vehicles VALUES ('VIN1')"
+psql_prod -q -c "ALTER TABLE telemetry_raw ADD COLUMN vin text REFERENCES vehicles(vin)"
+psql_prod -q -c "UPDATE telemetry_raw SET vin='VIN1'"
+dump_and_count_consistently "$WORK/db.dump" "$WORK/rowcounts.pre" soft >/dev/null 2>&1
+# rows that belong to no vehicle at all — legal, because the FK column is nullable
+psql_prod -q -c "INSERT INTO telemetry_raw (payload, vin) SELECT 'orphan'||i, NULL FROM generate_series(1,7) i"
+nullbefore="$(q "select count(*) from telemetry_raw where vin is null")"
+check "live has 7 NULL-vin rows before the revert" "$nullbefore" "7"
+restore_db_swap "$WORK/db.dump" "$WORK/rowcounts.pre" soft >/dev/null 2>&1 \
+  && ok "soft restore succeeded with NULL-vin rows" || { warn "soft restore FAILED"; (( ++FAIL )); }
+check "NULL-vin telemetry carried over, not dropped" \
+  "$(q "select count(*) from telemetry_raw where vin is null")" "7"
+
+# --------------------------------------------------------------- case 10 --
+# The library must not install an EXIT trap: revert.sh's EXIT trap is the only
+# thing that restarts the services and cron it stopped, and displacing it meant
+# every aborted restore left production down with nothing saying so.
+hdr "10. an aborted restore must leave the CALLER's EXIT trap intact"
+fresh_live
+take_backup
+sed -i 's/^public\.users|10/public.users|999/' "$WORK/rowcounts.pre"
+trap_marker="$WORK/caller-exit-trap-ran"
+rm -f "$trap_marker"
+(
+  trap 'printf ran > "$trap_marker"' EXIT
+  restore_db_swap "$WORK/db.dump" "$WORK/rowcounts.pre" full
+) >/dev/null 2>&1
+check "caller's EXIT trap still ran after the abort" \
+  "$([[ -f "$trap_marker" ]] && echo yes || echo no)" "yes"
+rm -f "$trap_marker"
+
+# --------------------------------------------------------------- case 11 --
+# The swap closes the live database to connections; both renames carry that
+# property. If it is not reopened, every service fails to connect and the revert
+# still reports success.
+hdr "11. both databases accept connections again after a successful swap"
+fresh_live
+take_backup
+restore_db_swap "$WORK/db.dump" "$WORK/rowcounts.pre" full >/dev/null 2>&1 \
+  && ok "restore_db_swap succeeded" || { warn "restore_db_swap FAILED"; (( ++FAIL )); }
+check "live database accepts connections" \
+  "$(psql_maint -tAc "select datallowconn from pg_database where datname='$PG_DB'")" "t"
+check "aside database accepts connections" \
+  "$(psql_maint -tAc "select datallowconn from pg_database where datname='$ASIDE_DB'")" "t"
+
+# --------------------------------------------------------------- case 12 --
+# rowcounts.pre must never be stored containing psql error text: stderr is merged
+# into the counting stream, so a failed count used to land "ERROR: ..." in the file,
+# pass the -s check, and produce a backup that every revert refuses.
+hdr "12. a malformed row-count file must be rejected, not stored"
+fresh_live
+printf 'ERROR:  permission denied for table users\n' > "$WORK/rowcounts.bad"
+( restore_db_swap "$WORK/db.dump" "$WORK/rowcounts.bad" full ) >/dev/null 2>&1
+rc=$?
+check "restore refused a malformed row-count file" "$(( rc != 0 ))" "1"
+check "no side database left behind" \
+  "$(psql_maint -tAc "select count(*) from pg_database where datname like 'evelio_restore_%'")" "0"
+
 # ------------------------------------------------------------------ done --
 hdr "$( (( FAIL )) && echo "${C_RED}selftest: $FAIL failed, $PASS passed${C_OFF}" || echo "${C_GRN}selftest: all $PASS checks passed${C_OFF}")"
 exit $(( FAIL > 0 ))

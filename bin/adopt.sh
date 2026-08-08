@@ -83,7 +83,14 @@ while IFS= read -r -d '' p; do
   is_protected "$rel" && continue
   printf '%s\n' "${FILES[@]}" | grep -qxF "$rel" && continue
   unknown+=("$rel")
-done < <(find "$BACKEND_DIR" -mindepth 1 -maxdepth 1 -print0)
+  # Recurse: a depth-1 scan only enforced "reported, never removed" at the top
+  # level, so server-only code in a subdirectory of the run-dir was never
+  # surfaced for a human to classify. Prune the protected dirs rather than
+  # walking into tokens/ and .venv/.
+done < <(find "$BACKEND_DIR" -mindepth 1 \
+              \( -name tokens -o -name .venv -o -name __pycache__ \
+                 -o -name _bak_archive -o -name '.git' \) -prune -o \
+              -type f -print0)
 
 log "  identical to main : $same"
 log "  differ from main  : ${#differs[@]}"
@@ -120,6 +127,32 @@ if (( ! APPLY )); then
   log "either (a) also in main, or (b) intentionally server-only, run:"
   log "    sudo $0 --apply"
   exit 0
+fi
+
+# releases/current is the SINGLE backup. If it holds a real deploy release,
+# re-baselining rewrites meta.env to RELEASE_KIND=baseline / HAS_DB_DUMP=0, and
+# revert.sh then refuses with "there has been no deploy to revert" even though
+# db.dump and backend/ are still sitting on disk. The way back is destroyed by
+# what looks like a metadata-only operation — and update.sh's own drift message
+# recommends running this, so it is an easy mistake to make.
+if [[ -f "$RELEASE_DIR/meta.env" ]]; then
+  ( load_release_meta ) >/dev/null 2>&1 || true
+  _kind="$(sed -n 's/^RELEASE_KIND=//p' "$RELEASE_DIR/meta.env" | tail -1)"
+  if [[ "$_kind" == "deploy" ]]; then
+    hdr "${C_RED}A REAL DEPLOY BACKUP ALREADY EXISTS${C_OFF}"
+    log "  $RELEASE_DIR holds the backup from a previous update.sh --apply:"
+    log "    release : $(sed -n 's/^RELEASE_ID=//p' "$RELEASE_DIR/meta.env" | tail -1)"
+    log "    created : $(sed -n 's/^CREATED_AT=//p' "$RELEASE_DIR/meta.env" | tail -1)"
+    log "    dump    : $(sed -n 's/^DB_DUMP_MODE=//p' "$RELEASE_DIR/meta.env" | tail -1)"
+    log ""
+    log "Re-baselining would overwrite its metadata and make bin/revert.sh refuse to"
+    log "restore it — that backup is the only way back from that deploy."
+    log ""
+    log "If you are trying to clear DRIFT, you do not need adopt.sh: inspect the drift,"
+    log "merge the hand-edit into main, and deploy. Only re-baseline once you no longer"
+    log "need to revert that deploy."
+    die "refusing to overwrite a deploy backup with an adopt.sh baseline."
+  fi
 fi
 
 if (( ${#differs[@]} )); then

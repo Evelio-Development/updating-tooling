@@ -68,7 +68,19 @@ fi
 # everything production has done SINCE the first revert, and creates a second
 # aside database — with the first revert's aside (the only copy of the
 # post-deploy data) still sitting there unmentioned.
-if [[ -n "${REVERTED_AT:-}" ]]; then
+# Gate on what was actually CONSUMED, not merely on "a revert happened". A
+# previous --code-only revert restored no dump, so warning that this one would
+# "restore the SAME dump on top, discarding everything since" would be false —
+# and a guard that cries wolf is how --force becomes reflexive. Likewise a
+# previous --db-only revert does not make a later code revert a double-restore.
+_already_consumed=0
+case "${REVERTED_MODE:-}" in
+  full)      _already_consumed=1 ;;                       # both halves used
+  db-only)   (( CODE_ONLY )) || _already_consumed=1 ;;    # dump used
+  code-only) (( CODE_ONLY )) && _already_consumed=1 ;;    # code snapshot used
+  *) [[ -n "${REVERTED_AT:-}" ]] && _already_consumed=1 ;;  # older release, unknown mode
+esac
+if [[ -n "${REVERTED_AT:-}" ]] && (( _already_consumed )); then
   hdr "THIS BACKUP HAS ALREADY BEEN REVERTED"
   log "  reverted at : $REVERTED_AT  (mode: ${REVERTED_MODE:-?})"
   log ""
@@ -87,6 +99,26 @@ fi
 
 [[ -f "$RELEASE_DIR/FILES.new" ]] || die "backup has no FILES.new (file list) — it is incomplete"
 [[ -d "$RELEASE_DIR/backend"  ]] || die "backup has no backend snapshot"
+# "Absent from backend/" drives `rm -f` on production below, so it must mean "did
+# not exist pre-deploy" and never "the snapshot is truncated". A snapshot cut short
+# by an interrupt or ENOSPC passes the two checks above while being empty or
+# partial, and the restore would then delete every deployed file and report ok.
+[[ -n "$(find "$RELEASE_DIR/backend" -type f -print -quit 2>/dev/null)" ]] \
+  || die "the backend snapshot in $RELEASE_DIR contains no files at all. This backup is
+       incomplete (an interrupted update.sh). Restoring it would DELETE production's
+       backend code. Refusing. Use --db-only, or restore code from git by hand."
+if [[ -f "$RELEASE_DIR/MANIFEST.pre" ]]; then
+  _missing=0
+  while read -r _sha _rel; do
+    [[ -n "${_rel:-}" && "$_sha" != "ABSENT" ]] || continue
+    is_protected "$_rel" && continue
+    [[ -f "$RELEASE_DIR/backend/$_rel" ]] || { warn "  snapshot is missing $_rel"; _missing=1; }
+  done < "$RELEASE_DIR/MANIFEST.pre"
+  (( _missing )) && die "the backend snapshot is missing files that the pre-deploy manifest
+       says were deployed (listed above) — it is incomplete. Restoring it would remove
+       them from production permanently. Refusing."
+  ok "backend snapshot matches the pre-deploy manifest"
+fi
 [[ -f "$RELEASE_DIR/frontend/webroot.tgz" ]] || die "backup has no frontend snapshot"
 tar -tzf "$RELEASE_DIR/frontend/webroot.tgz" >/dev/null 2>&1 || die "frontend snapshot is not a readable tarball"
 ok "code + frontend snapshots readable"
@@ -218,6 +250,10 @@ on_abort() {
   (( INTERRUPTED )) && rc=130
   (( rc == 0 )) && return 0
   trap - EXIT
+  # Tidy any scratch database and reopen connections first. restore_db_swap
+  # deliberately installs no EXIT trap of its own (it would displace this one,
+  # and this is the only thing that restarts the services stopped below).
+  declare -F _rds_cleanup >/dev/null && _rds_cleanup || true
   warn "revert aborted (rc=$rc) — restarting services"
   restart_all || true
   exit "$rc"
@@ -261,13 +297,19 @@ if (( ! DB_ONLY )); then
 
   if [[ -f "$RELEASE_DIR/ingest/fetch_odometer.py" ]]; then
     cp -a "$RELEASE_DIR/ingest/fetch_odometer.py" "$INGEST_DIR/"
-    sha_dir_manifest "$INGEST_DIR" fetch_odometer.py > "$RELEASE_DIR/MANIFEST.ingest"
     ok "fetch_odometer.py restored"
   fi
   if [[ -f "$RELEASE_DIR/ingest/ingest_from_dockerlogs.py" ]]; then
     cp -a "$RELEASE_DIR/ingest/ingest_from_dockerlogs.py" "$INGEST_DIR/"
     ok "ingest_from_dockerlogs.py restored"
   fi
+  # Re-fingerprint every ingest file, covering both names — otherwise the next
+  # update.sh reports the restore itself as drift and refuses.
+  _ri=()
+  for _f in fetch_odometer.py ingest_from_dockerlogs.py; do
+    [[ -f "$INGEST_DIR/$_f" ]] && _ri+=("$_f")
+  done
+  (( ${#_ri[@]} )) && sha_dir_manifest "$INGEST_DIR" "${_ri[@]}" > "$RELEASE_DIR/MANIFEST.ingest"
 
   info "restoring $WEBROOT"
   if restore_webroot "$RELEASE_DIR/frontend/webroot.tgz"; then
@@ -278,11 +320,17 @@ if (( ! DB_ONLY )); then
 
   if [[ "${WITH_CADDY:-0}" == "1" && -f "$RELEASE_DIR/caddy/Caddyfile" ]]; then
     if ! cmp -s "$RELEASE_DIR/caddy/Caddyfile" "$CADDYFILE"; then
-      cp -a "$CADDYFILE" "$CADDYFILE.bak.$(now_id)"
-      cp "$RELEASE_DIR/caddy/Caddyfile" "$CADDYFILE"
-      caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null \
-        && systemctl reload caddy && ok "Caddyfile restored + reloaded" \
-        || warn "restored Caddyfile did not validate — the running config is unchanged; fix by hand"
+      # Validate before installing, so a bad snapshot cannot leave an invalid
+      # config on disk to break the next reload or reboot.
+      if caddy validate --config "$RELEASE_DIR/caddy/Caddyfile" --adapter caddyfile >/dev/null 2>&1; then
+        cp -a "$CADDYFILE" "$CADDYFILE.bak.$(now_id)"
+        cp "$RELEASE_DIR/caddy/Caddyfile" "$CADDYFILE"
+        systemctl reload caddy && ok "Caddyfile restored + reloaded" \
+          || warn "caddy reload failed — check 'journalctl -u caddy'"
+      else
+        warn "the backed-up Caddyfile does not validate — it was NOT installed and the
+       running config is unchanged; fix by hand"
+      fi
     fi
   fi
 fi
@@ -300,13 +348,18 @@ started: $(date -u +%FT%TZ)
 If no database named '$PG_DB' exists, YOUR DATA IS SAFE under an
 evelio_prerevert_* database. List them:
   docker exec -i $PG_CONTAINER psql -U $PG_USER -d postgres -c '\\l'
-Put it back:
+Put it back — BOTH statements. The swap closes the database to connections and
+the rename carries that with it, so without the second one every service will
+fail with 'database "$PG_DB" is not currently accepting connections':
   docker exec -i $PG_CONTAINER psql -U $PG_USER -d postgres \\
-    -c 'ALTER DATABASE "<evelio_prerevert_...>" RENAME TO "$PG_DB"'
+    -c 'ALTER DATABASE "<evelio_prerevert_...>" RENAME TO "$PG_DB"' \\
+    -c 'ALTER DATABASE "$PG_DB" WITH ALLOW_CONNECTIONS true'
 Then: systemctl start ${BACKEND_SERVICES[*]} $INGEST_SERVICE cron
 Finally delete this file.
 EOF
-  trap '' INT TERM HUP
+  # restore_db_swap handles signals itself: it stays interruptible (with cleanup)
+  # through the long pg_restore, and blocks INT/TERM/HUP across the two renames,
+  # which is the only genuinely unrecoverable window.
   restore_db_swap "$RELEASE_DIR/db.dump" "$RELEASE_DIR/rowcounts.pre" "${DB_DUMP_MODE:-full}"
   trap on_signal INT TERM HUP
   breadcrumb_clear
@@ -338,7 +391,8 @@ if (( ! CODE_ONLY )); then
   log "  undo this revert (stop the services first):"
   log "      docker exec -i $PG_CONTAINER psql -U $PG_USER -d postgres -c \\"
   log "        'ALTER DATABASE \"$PG_DB\" RENAME TO \"${PG_DB}_undo_$(now_id)\";"
-  log "         ALTER DATABASE \"$ASIDE_DB\" RENAME TO \"$PG_DB\";'"
+  log "         ALTER DATABASE \"$ASIDE_DB\" RENAME TO \"$PG_DB\";"
+  log "         ALTER DATABASE \"$PG_DB\" WITH ALLOW_CONNECTIONS true;'"
   log "  free the space when you are sure:  sudo $HERE/bin/status.sh --prune-aside"
 fi
 if (( VERIFY_FAILED )); then

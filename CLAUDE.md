@@ -35,7 +35,13 @@ and it is never "nowhere". Do not "simplify" this into `dropdb && pg_restore`.
 ```
 
 A release directory holds: `meta.env`, `MANIFEST` (CRLF-normalised sha256 per
-deployed backend file), `MANIFEST.ingest`, `FILES.new` / `FILES.prev` (the file
+deployed backend file), `MANIFEST.pre` (the same, as of *before* this deploy —
+`MANIFEST` is rewritten post-deploy, and without a separate copy there is no record
+of which files existed pre-deploy, which is what lets `revert.sh` tell "this file
+did not exist before, remove it" apart from "the snapshot is truncated, do NOT
+delete production's copy"), `MANIFEST.ingest` (**every** deployed ingest file, not
+just `fetch_odometer.py` — `ingest_from_dockerlogs.py` was deployed with no drift
+gate at all), `FILES.new` / `FILES.prev` (the file
 lists that drive restore), `backend/` (pre-deploy code snapshot),
 `frontend/webroot.tgz`, `ingest/`, `caddy/Caddyfile`, `rowcounts.pre`, `db.dump`.
 
@@ -43,7 +49,7 @@ lists that drive restore), `backend/` (pre-deploy code snapshot),
 
 | script | what it does |
 |---|---|
-| `bin/adopt.sh` | one-time bootstrap: diffs live `/opt/tesla-oauth` against `origin/main`, shows every drift, records the first baseline once a human approves. Writes nothing to prod. |
+| `bin/adopt.sh` | one-time bootstrap: diffs live `/opt/tesla-oauth` against `origin/main`, shows every drift, records the first baseline once a human approves. Writes nothing to prod. **Refuses to run when `releases/current` holds a real deploy release** — re-baselining rewrote `meta.env` to `RELEASE_KIND=baseline`/`HAS_DB_DUMP=0`, so `revert.sh` then said "there has been no deploy to revert" while `db.dump` sat on disk. Clearing drift is not a reason to re-baseline. |
 | `bin/update.sh` | pre-flight → plan → confirm → backup → build → migrate → code → frontend → restart → verify. Dry-run unless `--apply`. |
 | `bin/revert.sh` | restores the single kept release. Dry-run unless `--apply`. |
 | `bin/status.sh` | what's deployed, what the backup holds, drift, kept aside-databases, breadcrumbs. |
@@ -61,6 +67,13 @@ lists that drive restore), `backend/` (pre-deploy code snapshot),
 - **One run at a time (`take_lock`).** Without a lock, "I wasn't sure it
   finished, let me run it again" becomes two runs interleaving migrations and the
   second destroying the backup the first needs for its rollback.
+- **A library must never install an EXIT trap.** `restore_db_swap()` used to do
+  `trap _rds_cleanup EXIT INT TERM`, which *replaced* `revert.sh`'s `on_abort` —
+  the only thing that restarts the services and cron the revert stopped. Every
+  aborted restore (row-count mismatch, corrupt dump, failed `CREATE DATABASE` —
+  i.e. the expected path) therefore exited with production stopped and nothing
+  saying so. It now traps signals only, and `on_abort` calls `_rds_cleanup`
+  itself. `selftest.sh` case 10 asserts the caller's EXIT trap survives an abort.
 - **Signals must be handled, not just errors.** A bash script killed by a signal
   runs its EXIT trap with `$? == 0`. Without the `INTERRUPTED` flag that
   `on_signal` sets, a Ctrl-C or dropped SSH mid-deploy would look like success
@@ -124,16 +137,46 @@ lists that drive restore), `backend/` (pre-deploy code snapshot),
   load-bearing (without it only `psql`'s status is seen, so a `COPY` that dies
   mid-stream looks like success — and soft mode exempts `telemetry_raw` from row
   verification, so the swap would silently truncate production's telemetry; it is
-  the one path here that could destroy data while printing `ok`), and rows whose
+  the one path here that could destroy data while printing `ok`), the filter must be
+  `vin IS NULL OR vin IN (…)` — `vin IN (…)` is NULL, and so selects nothing, for a
+  nullable FK column, and the carry-over's own count check used that same predicate
+  and therefore agreed with itself while dropping every NULL-vin row
+  (`selftest.sh` case 9), the `COPY` must **name its columns** on both sides because
+  the source is the post-deploy table and the target the pre-deploy one, so ordinal
+  matching would load telemetry into renamed or reordered columns unnoticed, and rows whose
   vehicle the revert removes are **filtered and reported**, because
   `telemetry_raw.vin` has a foreign key to `vehicles` and the restored vehicle
   list is rewound. Those rows remain in the kept pre-revert database.
 - **A backup is a one-shot.** `revert.sh` refuses to run twice against the same
   release without `--force`, and points at the aside databases first. Reverting
-  twice would restore the same dump on top and discard everything since.
+  twice would restore the same dump on top and discard everything since. The gate
+  keys on `REVERTED_MODE` — what was actually *consumed* — not merely on
+  `REVERTED_AT`: a previous `--code-only` revert restored no dump, so warning that
+  a later DB revert would "restore the SAME dump, discarding everything since" was
+  simply false, and a guard that cries wolf is how `--force` becomes reflexive.
+- **The row counts must be provably complete.** `dump_and_count_consistently`
+  merges stderr into the counting stream, so a count that errored used to leave
+  `ERROR: …` text in `rowcounts.pre`, pass the `-s` check, and store a "verified"
+  backup that every later revert refused while blaming the dump. It now requires
+  the `__COUNTS_END__` sentinel and that every line match `table|digits`.
 - **A revert rewrites the MANIFEST**, and so does `rollback_code`. Otherwise the
   next `update.sh` sees the whole rollback as drift and refuses, telling the
   operator something false.
+- **`status.sh --prune-aside` is a destructive command and is gated like one.**
+  An `evelio_prerevert_*` database is not always the spare copy: between the two
+  renames of a swap, and after any crash in that window, it **is** production's
+  only data and no database named `evelio` exists. Pruning then destroyed prod
+  irrecoverably, while the prompt's own wording ("the ONLY copies") read as
+  reassurance. It now calls `assert_no_breadcrumb`, takes the lock, refuses when
+  `$PG_DB` does not exist, and skips any candidate with live sessions.
+- **Reopening the database after the swap is not optional.** The swap sets
+  `ALLOW_CONNECTIONS false`, and *both* renames carry that property with the name.
+  Swallowing the reopen with `|| true` meant `restart_all` could start every
+  service against a database refusing connections while the revert printed
+  success. Every printed recovery command therefore includes the
+  `ALLOW_CONNECTIONS true` statement as well as the rename — without it the
+  operator gets `database "evelio" is not currently accepting connections` and no
+  hint why. `selftest.sh` case 11 asserts `datallowconn` on both databases.
 - **The breadcrumb is not decoration.** The two renames have a moment between
   them where no database is named `evelio`. If the machine dies there, that file
   is the only thing on disk that says what happened. `assert_no_breadcrumb`
@@ -156,15 +199,30 @@ lists that drive restore), `backend/` (pre-deploy code snapshot),
   never mirrored, never deleted, never counted as drift. A "true mirror" that
   deletes anything not in git would delete the OAuth tokens. Files unknown to git
   and not protected are **reported, never removed**.
+- **`legal/` needs `- legal/***` as well as `P legal/***`.** rsync's `P` stops a
+  receiver-side file being *deleted*; it does **not** stop it being *overwritten*
+  when the sender has one of the same name. The snapshot is a tar of the whole
+  webroot, so it contains `legal/` — meaning a hand-republished PDF under a name
+  that also existed at backup time (and the tracked `*-1.0.pdf` names are exactly
+  the ones re-published in place) was silently rolled back. The deploy path
+  publishes tracked PDFs in a separate `--ignore-existing` pass, so a genuinely new
+  agreement version still ships but nothing published is ever replaced.
 - **`legal/` is never deleted by a restore.** Published agreement PDFs live in
   `/var/www/evelio-app/legal`. Some versions *are* tracked in the app repo
   (`frontend/public/legal/*-1.0.pdf`, which Vite copies into `dist/`), but others
   — the hand-published ones — exist only on the server and are legally operative.
   `restore_webroot()` therefore uses `--filter='P legal/***'`, and the revert dry
   run lists every webroot file the restore *would* remove.
-- **Frontend publish is staged and swapped**, not `rm -rf assets` followed by a
-  slow `cp`: that leaves an `index.html` referencing JS that is not there yet — a
-  white-screened production site, permanently if interrupted.
+- **Frontend publish is staged and then applied with ONE rsync pass**, not
+  `rm -rf assets` followed by a slow `cp` (that leaves an `index.html` referencing
+  JS which is not there yet — a white-screened production site, permanently if
+  interrupted) and not "move the live tree aside, then move the new one in"
+  either: that had a window between the two loops where the webroot held no
+  `index.html` and no `assets/` at all, and it discarded every `mv` error before
+  unconditionally `rm -rf`ing the retired copy — so one failed rename (EACCES, or
+  `assets/` nesting into `assets/assets/`) deleted the live webroot, hand-published
+  `legal/` PDFs included. rsync replaces in place and never empties the directory;
+  the result is asserted (`index.html` + `assets/`) before anything is cleaned up.
 - **`origin/main` tip only.** Resolved as the remote ref explicitly — a bare
   `main` resolves to a local branch that `git fetch` never advances, the
   stale-checkout trap the staging tooling documents. There is intentionally no
@@ -172,6 +230,23 @@ lists that drive restore), `backend/` (pre-deploy code snapshot),
 
 ### The test gate
 
+- **An empty suite is not a passing suite.** `TESTS=( "$REPO"/test_*.py )` with
+  `exit 0` on no matches was the last remaining bypass, and it needed no flag: a
+  repo that moved tests into `tests/`, renamed them `*_test.py`, or an incomplete
+  checkout turned the hard gate into a silent no-op that printed "all tests
+  passed". The glob must find at least `MIN_TEST_FILES` files or the gate exits 2.
+- **Infrastructure failures must not be reported as failing tests.** A wrong or
+  missing `STAGING_PG_PASS` made every database-touching test die in collection,
+  which the runner counted as a plain FAIL — so it exited 1 and `update.sh` told
+  the operator to go fix tests in the app repo. `run-tests.sh` now proves it can
+  reach the throwaway database with the credentials the tests will use, and exits
+  2 if it cannot. Some of the documented "9 of 14 failing" was this.
+- **The prod-connection guard must PARSE connection strings.** Substring-matching
+  for `5432`/`dbname=evelio ` missed
+  `psycopg2.connect("postgresql://evelio:pw@host/evelio")` entirely — no literal
+  port, no `dbname=` — and then fell back to the *test* env values, which pass. It
+  parses URI and keyword/value forms and fails closed, and the liveness assertion
+  covers the URI form too, because the kwargs-only assertion could not see this gap.
 - **It is strict and has no bypass.** A failing test is fixed or deleted in the
   app repo. `--skip-tests` was removed on purpose (the human's call): an escape
   hatch on a deploy gate gets used every time, and then the gate is decoration.
@@ -199,11 +274,24 @@ lists that drive restore), `backend/` (pre-deploy code snapshot),
   (a stray line in a sourced file could redefine `WEBROOT` or `PG_DB`).
 - **The bundle is verified before publishing**: it must contain the configured
   prod API base and must not reference a dev/staging host, and a Cloudflare
-  *testing* sitekey (`1x…/2x…/3x…`) is rejected outright.
+  *testing* sitekey (`1x…/2x…/3x…`) is rejected outright — checked on the **built
+  artifact**, not only on `frontend-build.env`, which proves only what we passed
+  *in*; the app repo shipping its own `frontend/.env*` could otherwise put a
+  testing sitekey into production while the gate said "bundle verified". Scan the
+  whole `dist/` tree, not just `dist/assets/`, and **without** `2>/dev/null`: a
+  renamed `assets/` dir made the dev-host grep exit non-zero, which read as "no dev
+  host found" and silently passed.
+- **A release directory is mode 700 and `db.dump` is created mode 600.** It holds a
+  full `pg_dump` of production — PII, password hashes, token columns — and under the
+  default `0022` umask that was world-readable. The dump is created with
+  `install -m 600` *before* data goes into it; chmod-ing afterwards leaves a window.
 - **Agreement publishing (`DEPLOY.md` §D) is deliberately out of scope.** It
   emails every user. A deploy tool must not do that as a side effect.
-- **Caddy is opt-in (`--with-caddy`)** and always backup → `caddy validate` →
-  reload. If validate fails the old config keeps running.
+- **Caddy is opt-in (`--with-caddy`)** and always backup → `caddy validate` the
+  **source** → install → reload. If validate fails nothing is installed. Installing
+  first and validating after looked contained — the running Caddy keeps its
+  in-memory config — but left an invalid file at `/etc/caddy/Caddyfile`, so the next
+  reload, package upgrade or reboot took TLS and the proxy down for production.
 - **Never add any of this to a timer, cron, or `systemctl enable`.** Deploys are
   deliberate manual acts, same as the parent stack.
 

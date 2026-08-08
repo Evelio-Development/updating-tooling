@@ -29,13 +29,30 @@ _RDS_DONE=0
 _rds_cleanup() {
   (( _RDS_DONE )) && return 0
   if (( _RDS_LOCKED )); then
-    psql_maint -c "ALTER DATABASE \"$PG_DB\" WITH ALLOW_CONNECTIONS true" >/dev/null 2>&1 || true
+    # Reopen whichever name the database is actually under right now. If we were
+    # interrupted between the two renames, $PG_DB does not exist and the data is
+    # under $ASIDE_DB — which carries the ALLOW_CONNECTIONS=false with it. Only
+    # reopening $PG_DB would leave the surviving copy closed to every client.
+    local d
+    for d in "$PG_DB" "${ASIDE_DB:-}"; do
+      [[ -n "$d" ]] || continue
+      psql_maint -c "ALTER DATABASE \"$d\" WITH ALLOW_CONNECTIONS true" >/dev/null 2>&1 || true
+    done
     _RDS_LOCKED=0
   fi
   if [[ -n "$_RDS_SIDE" ]]; then
     psql_maint -c "DROP DATABASE IF EXISTS \"$_RDS_SIDE\" WITH (FORCE)" >/dev/null 2>&1 || true
     _RDS_SIDE=""
   fi
+}
+
+# A signal during the (long) pre-swap phase: tidy the scratch database and exit
+# 130, letting the CALLER's EXIT trap bring production's services back up.
+_rds_on_signal() {
+  INTERRUPTED=1
+  trap '' INT TERM HUP
+  _rds_cleanup
+  exit 130
 }
 
 restore_db_swap() {   # $1 = dump file, $2 = rowcounts file, $3 = full|soft
@@ -45,7 +62,12 @@ restore_db_swap() {   # $1 = dump file, $2 = rowcounts file, $3 = full|soft
   side="evelio_restore_$ts"
   ASIDE_DB="evelio_prerevert_$ts"
   _RDS_SIDE="$side"; _RDS_LOCKED=0; _RDS_DONE=0
-  trap _rds_cleanup EXIT INT TERM
+  # Signals only — this function must NOT install an EXIT trap. revert.sh's EXIT
+  # trap (on_abort) is the ONLY thing that restarts the services and cron it
+  # stopped; replacing it here meant every aborted restore (row-count mismatch,
+  # unreadable dump, failed CREATE DATABASE) exited with production stopped and
+  # nothing said so. revert.sh's on_abort calls _rds_cleanup itself.
+  trap _rds_on_signal INT TERM HUP
 
   [[ -f "$dump" ]] || die "restore_db_swap: no dump at $dump"
   [[ -s "$pre"  ]] || die "restore_db_swap: no row counts at $pre"
@@ -152,32 +174,64 @@ restore_db_swap() {   # $1 = dump file, $2 = rowcounts file, $3 = full|soft
   # (ALTER DATABASE … SET), the database ACL, connection limit and comment.
   _copy_database_level_state "$side"
 
+  # Wait for the terminated backends to actually detach. ALTER DATABASE … RENAME
+  # fails while any session is still attached, and a backend winding down a long
+  # statement would otherwise turn into the abort below for no reason.
+  local i drained=0
+  for i in {1..30}; do
+    [[ "$(psql_maint -tAc "select count(*) from pg_stat_activity
+            where datname='$PG_DB' and pid <> pg_backend_pid()" </dev/null 2>/dev/null || echo 1)" == "0" ]] \
+      && { drained=1; break; }
+    sleep 1
+  done
+  (( drained )) || warn "sessions are still attached to '$PG_DB' after 30s — the rename may fail"
+
+  # Signals are BLOCKED across the two renames: between them there is no database
+  # named $PG_DB, and a handler that ran here would drop the verified copy and
+  # leave production down. The breadcrumb is the only on-disk record of this
+  # window, and the caller writes it before calling us.
   info "swapping databases"
+  trap '' INT TERM HUP
   psql_maint -c "ALTER DATABASE \"$PG_DB\" RENAME TO \"$ASIDE_DB\"" >/dev/null \
-    || { _rds_cleanup; die "could not rename the live database — nothing changed."; }
+    || { trap _rds_on_signal INT TERM HUP; _rds_cleanup
+         die "could not rename the live database — nothing changed."; }
 
   if ! psql_maint -c "ALTER DATABASE \"$side\" RENAME TO \"$PG_DB\"" >/dev/null; then
     warn "second rename failed — putting the original database back"
     if psql_maint -c "ALTER DATABASE \"$ASIDE_DB\" RENAME TO \"$PG_DB\"" >/dev/null; then
+      trap _rds_on_signal INT TERM HUP
       _rds_cleanup
       die "swap aborted — the production database is unchanged and back in place."
     fi
     # Do NOT reopen/cleanup here: the data is under $ASIDE_DB and must be left
     # exactly where it is for the human. Suppress the trap's tidying.
     _RDS_DONE=1; RDS_CRITICAL=1
+    # The rename carried ALLOW_CONNECTIONS=false onto $ASIDE_DB, so renaming it
+    # back is NOT enough — without the second statement the operator gets
+    # "database is not currently accepting connections" and no hint why.
     die "CRITICAL: no database named '$PG_DB' exists right now.
-       YOUR DATA IS INTACT under '$ASIDE_DB'. Put it back by hand:
+       YOUR DATA IS INTACT under '$ASIDE_DB'. Put it back by hand — BOTH
+       statements, the second one matters:
          docker exec -i $PG_CONTAINER psql -U $PG_USER -d postgres \\
-           -c 'ALTER DATABASE \"$ASIDE_DB\" RENAME TO \"$PG_DB\"'
-       Do NOT start the services until that succeeds."
+           -c 'ALTER DATABASE \"$ASIDE_DB\" RENAME TO \"$PG_DB\"' \\
+           -c 'ALTER DATABASE \"$PG_DB\" WITH ALLOW_CONNECTIONS true'
+       Do NOT start the services until both succeed."
   fi
 
   # The rename carried the ALLOW_CONNECTIONS=false with the old name; make sure
-  # the database that is now live accepts connections again.
-  psql_maint -c "ALTER DATABASE \"$PG_DB\" WITH ALLOW_CONNECTIONS true" >/dev/null || true
-  psql_maint -c "ALTER DATABASE \"$ASIDE_DB\" WITH ALLOW_CONNECTIONS true" >/dev/null || true
+  # the database that is now live accepts connections again. This is NOT optional
+  # — swallowing a failure here means restart_all starts every service against a
+  # database that refuses to talk to them, and the revert reports success.
+  psql_maint -c "ALTER DATABASE \"$PG_DB\" WITH ALLOW_CONNECTIONS true" >/dev/null \
+    || die "the swap completed but '$PG_DB' could not be reopened to connections.
+       The restored data IS in place. Run this before starting anything:
+         docker exec -i $PG_CONTAINER psql -U $PG_USER -d postgres \\
+           -c 'ALTER DATABASE \"$PG_DB\" WITH ALLOW_CONNECTIONS true'"
+  # The aside copy must be reachable too, or "undo this revert" cannot be used.
+  psql_maint -c "ALTER DATABASE \"$ASIDE_DB\" WITH ALLOW_CONNECTIONS true" >/dev/null \
+    || warn "could not reopen '$ASIDE_DB' to connections — do that before trying to undo this revert."
   _RDS_LOCKED=0; _RDS_SIDE=""; _RDS_DONE=1
-  trap - EXIT INT TERM
+  trap - INT TERM HUP
 
   ok "'$PG_DB' is now the restored copy; the pre-revert data is kept as '$ASIDE_DB'"
 }
@@ -224,7 +278,38 @@ _carry_over_telemetry() {  # $1 = side db
       warn "the restored database has no vehicles — no telemetry can be carried over."
       return 1
     fi
-    where="WHERE vin IN ($vins)"
+    # `vin IN (...)` is NULL — i.e. NOT selected — for a row with a NULL vin, and
+    # telemetry_raw.vin is nullable (the FK permits it). Without the IS NULL arm
+    # every NULL-vin row is dropped, and because the count check below uses this
+    # same predicate it would agree with itself and report success: telemetry
+    # destroyed while printing ok, in the one place row verification is exempt.
+    where="WHERE vin IS NULL OR vin IN ($vins)"
+  fi
+
+  # Name the columns explicitly on BOTH sides. The source is the post-deploy live
+  # table and the target is the pre-deploy restored one; a bare `SELECT *` / `COPY
+  # FROM STDIN` pair matches by ordinal position, so a migration that RENAMED or
+  # reordered two same-typed columns would load telemetry into the wrong columns,
+  # silently — soft mode exempts this table from row verification. Using the
+  # target's column list turns that into an honest error instead.
+  local cols
+  cols="$(sq "select string_agg(quote_ident(attname), ',' order by attnum)
+              from pg_attribute
+              where attrelid = 'public.telemetry_raw'::regclass
+                and attnum > 0 and not attisdropped")"
+  [[ -n "$cols" ]] || { warn "could not read telemetry_raw's columns in $side"; return 1; }
+  local livecols
+  livecols="$(lq "select string_agg(quote_ident(attname), ',' order by attnum)
+                  from pg_attribute
+                  where attrelid = 'public.telemetry_raw'::regclass
+                    and attnum > 0 and not attisdropped")"
+  if [[ "$cols" != "$livecols" ]]; then
+    warn "telemetry_raw's columns differ between the live and restored databases:
+       live    : ${livecols:-?}
+       restored: $cols
+       A soft revert cannot carry telemetry across a change to this table. Re-run
+       with --code-only, or restore the full dump."
+    return 1
   fi
 
   info "soft dump: copying live telemetry_raw into $side ($live_total rows — minutes, not seconds)"
@@ -236,9 +321,9 @@ _carry_over_telemetry() {  # $1 = side db
   # swap — the one path in this tool that could destroy data while printing ok.
   if ! docker exec -i "$PG_CONTAINER" bash -o pipefail -c \
       "psql -U '$PG_USER' -d '$PG_DB' -qtAX -c \
-         \"COPY (SELECT * FROM public.telemetry_raw $where) TO STDOUT\" \
+         \"COPY (SELECT $cols FROM public.telemetry_raw $where) TO STDOUT\" \
        | psql -U '$PG_USER' -d '$side' -v ON_ERROR_STOP=1 -q -c \
-         'COPY public.telemetry_raw FROM STDIN'" </dev/null; then
+         'COPY public.telemetry_raw ($cols) FROM STDIN'" </dev/null; then
     warn "telemetry carry-over failed — live database untouched, nothing lost."
     return 1
   fi
@@ -265,8 +350,9 @@ _carry_over_telemetry() {  # $1 = side db
   return 0
 }
 
-# Per-database settings, ACL, connection limit and comment are NOT in a
-# pg_dump -Fc, so a database-swap loses them unless they are copied across.
+# Per-database settings, ACL and connection limit are NOT in a pg_dump -Fc, so a
+# database-swap loses them unless they are copied across. (Database-level GRANTs
+# are reported, not reproduced — see the warning at the end.)
 # Today prod has none of these set; this exists so that stays true by accident
 # no longer.
 _copy_database_level_state() {  # $1 = side db
@@ -276,17 +362,39 @@ _copy_database_level_state() {  # $1 = side db
       where d.datname='$PG_DB'" </dev/null 2>/dev/null || echo 0)"
   if [[ "${n:-0}" != "0" ]]; then
     info "copying $n per-database setting(s) onto $side"
-    local stmts
+    # Three things the obvious one-liner gets wrong, all of which end as a single
+    # swallowed `warn` on a stressful revert:
+    #   * `ALTER DATABASE db IN ROLE r SET …` is not valid SQL. Role-scoped
+    #     settings need `ALTER ROLE r IN DATABASE db SET …`.
+    #   * replace(cfg,'=',' TO ') neither quotes the value nor stops at the first
+    #     `=`, so statement_timeout=30s becomes a syntax error.
+    #   * one -c is one implicit transaction, so a single bad statement discards
+    #     the good ones too. Run them one at a time.
+    local stmts failed=0 s
     stmts="$(psql_maint -tAc "
-      select coalesce(string_agg(format('ALTER DATABASE %I %s SET %s;',
-               '$side',
-               case when s.setrole = 0 then '' else 'IN ROLE '||pg_get_userbyid(s.setrole) end,
-               replace(cfg, '=', ' TO ')), ' '), '')
+      select string_agg(
+        case when s.setrole = 0
+             then format('ALTER DATABASE %I SET %I TO %L',
+                         '$side', split_part(cfg,'=',1),
+                         substr(cfg, strpos(cfg,'=')+1))
+             else format('ALTER ROLE %I IN DATABASE %I SET %I TO %L',
+                         pg_get_userbyid(s.setrole), '$side', split_part(cfg,'=',1),
+                         substr(cfg, strpos(cfg,'=')+1))
+        end, E'\n')
       from pg_db_role_setting s join pg_database d on d.oid=s.setdatabase,
            unnest(s.setconfig) cfg
       where d.datname='$PG_DB'" </dev/null 2>/dev/null || echo '')"
-    [[ -n "$stmts" ]] && psql_maint -c "$stmts" >/dev/null 2>&1 \
-      || warn "could not copy per-database settings — check them by hand after the swap"
+    if [[ -n "$stmts" ]]; then
+      while IFS= read -r s; do
+        [[ -n "$s" ]] || continue
+        psql_maint -c "$s" >/dev/null 2>&1 || { warn "  failed: $s"; failed=1; }
+      done <<<"$stmts"
+      (( failed )) && warn "some per-database settings were NOT copied onto the restored
+       database (listed above) — re-apply them by hand after the swap."
+    else
+      warn "there are $n per-database setting(s) on $PG_DB but none could be read —
+       check them by hand after the swap."
+    fi
   fi
 
   local lim
