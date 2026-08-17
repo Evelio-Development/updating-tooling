@@ -283,10 +283,16 @@ BREADCRUMB="$WORK/.swap-in-progress"
 
 # Exactly what revert.sh does: breadcrumb, restore, and on abort clear it only if
 # the library says the data's location is known.
+# restore_db_swap runs in a SUBSHELL here (die() must fail the case, not the
+# harness), so ASIDE_DB does not propagate back — the trap writes it out alongside
+# the state. Reading the parent's stale ASIDE_DB instead silently inspects the
+# PREVIOUS case's database, which is how this harness first lied to me.
 run_like_revert() {   # $1 = rowcounts file ; echoes the resulting RDS_DB_STATE
   breadcrumb_write <<<"a swap was in progress"
+  : > "$WORK/aside"
   (
     trap 'printf "%s" "${RDS_DB_STATE:-unset}" > "$WORK/state"
+          printf "%s" "${ASIDE_DB:-}" > "$WORK/aside"
           [[ "${RDS_DB_STATE:-safe}" == "safe" ]] && breadcrumb_clear' EXIT
     restore_db_swap "$WORK/db.dump" "$1" full
   ) >/dev/null 2>&1
@@ -332,6 +338,109 @@ check "revert.sh's on_abort still keys the breadcrumb on RDS_DB_STATE" \
   "$(awk '/^on_abort\(\)/,/^}/' "$HERE/bin/revert.sh" \
      | grep -qE 'RDS_DB_STATE' && grep -qE 'breadcrumb_clear' <(awk '/^on_abort\(\)/,/^}/' "$HERE/bin/revert.sh") \
      && echo wired || echo MISSING)" "wired"
+
+# --------------------------------------------------------------- case 14 --
+# _copy_database_level_state was the ONLY function in the revert path with no
+# coverage at all, and it duplicated the exact bug CLAUDE.md documents for the
+# verification loop: `psql_maint` is a `docker exec -i`, which drained the loop's
+# here-string on the first iteration. Statement #1 applied, every other one was
+# silently skipped, and `failed` stayed 0 so the swap reported success. Losing
+# search_path matters here specifically because prod has a `health` schema.
+hdr "14. ALL per-database settings survive the swap, not just the first"
+fresh_live
+psql_maint -c "ALTER DATABASE \"$PG_DB\" SET statement_timeout TO '30s'" >/dev/null
+psql_maint -c "ALTER DATABASE \"$PG_DB\" SET search_path TO 'public,health'" >/dev/null
+psql_maint -c "ALTER DATABASE \"$PG_DB\" SET work_mem TO '64MB'" >/dev/null
+take_backup
+restore_db_swap "$WORK/db.dump" "$WORK/rowcounts.pre" full >/dev/null 2>&1 \
+  && ok "restore_db_swap succeeded" || { warn "restore_db_swap FAILED"; (( ++FAIL )); }
+settings="$(psql_maint -tAc "select array_to_string(s.setconfig,',') from pg_db_role_setting s
+              join pg_database d on d.oid=s.setdatabase where d.datname='$PG_DB'")"
+for want in statement_timeout search_path work_mem; do
+  check "per-database setting '$want' carried across" \
+    "$(grep -q "$want" <<<"$settings" && echo yes || echo no)" "yes"
+done
+
+# --------------------------------------------------------------- case 15 --
+# The rowcounts.pre integrity guards live in dump_and_count_consistently (the
+# __COUNTS_END__ sentinel and the `table|digits` line check). Case 12 only ever
+# fed a bad file to restore_db_swap, which rejects it as an ordinary row-count
+# mismatch — so the PRODUCER's guards were never exercised, and deleting both of
+# them left the suite fully green. Force each failure by pointing the enumeration
+# at something the counting session cannot read.
+hdr "15. a backup whose row counts cannot be trusted is never stored"
+fresh_live
+_REAL_ENUM="$ROWCOUNT_ENUM_SQL"
+
+# (a) the count query itself errors -> ON_ERROR_STOP kills psql -> no sentinel.
+ROWCOUNT_ENUM_SQL="select 'select ''nope.nope''::text t, count(*) c from nope.nope'"
+( dump_and_count_consistently "$WORK/d15.dump" "$WORK/c15" full ) >/dev/null 2>&1
+check "a failed count query refuses to store a backup" "$(( $? != 0 ))" "1"
+
+# (b) the count output is not `table|digits` -> refuse rather than store it.
+ROWCOUNT_ENUM_SQL="select 'select ''ERROR:  permission denied for table users'''"
+( dump_and_count_consistently "$WORK/d15.dump" "$WORK/c15" full ) >/dev/null 2>&1
+check "malformed count output refuses to store a backup" "$(( $? != 0 ))" "1"
+ROWCOUNT_ENUM_SQL="$_REAL_ENUM"
+
+# --------------------------------------------------------------- case 16 --
+# The two branches after the first rename succeeds had no coverage. Force them by
+# stubbing psql_maint for exactly the statements under test — deterministic, where
+# racing a real rename would not be.
+_REAL_PSQL_MAINT_STUB=""
+psql_maint() {
+  local a
+  if [[ -n "$_REAL_PSQL_MAINT_STUB" ]]; then
+    for a in "$@"; do
+      [[ "$a" == *"$_REAL_PSQL_MAINT_STUB"* ]] && return 1
+    done
+  fi
+  docker exec -i "$PG_CONTAINER" psql -U "$PG_USER" -d postgres -v ON_ERROR_STOP=1 "$@"
+}
+
+hdr "16. a failed second rename puts the original database back"
+fresh_live
+take_backup
+before="$(q 'select count(*) from users')"
+_REAL_PSQL_MAINT_STUB='evelio_restore_'      # fail only side -> $PG_DB
+( restore_db_swap "$WORK/db.dump" "$WORK/rowcounts.pre" full ) >/dev/null 2>&1
+rc=$?
+_REAL_PSQL_MAINT_STUB=""
+check "aborted with non-zero exit"                  "$(( rc != 0 ))" "1"
+check "the live database is back under its own name" "$(db_exists "$PG_DB" && echo yes || echo no)" "yes"
+check "and still holds its data"                     "$(q 'select count(*) from users')" "$before"
+check "it accepts connections again"                 "$(psql_maint -tAc "select datallowconn from pg_database where datname='$PG_DB'")" "t"
+
+# --------------------------------------------------------------- case 17 --
+# The direction case 13 cannot reach: when BOTH renames fail there is no database
+# named $PG_DB, the data is under $ASIDE_DB, and the breadcrumb is the only record
+# of it. Deleting the RDS_DB_STATE="unresolved" transition left the whole suite
+# green, so this is the assertion that makes the breadcrumb contract two-sided.
+hdr "17. when the swap cannot be resolved, the breadcrumb is KEPT"
+BREADCRUMB="$WORK/.swap-in-progress"
+fresh_live
+take_backup
+_REAL_PSQL_MAINT_STUB="RENAME TO \"$PG_DB\""   # fail the swap AND the recovery
+state="$(run_like_revert "$WORK/rowcounts.pre")"
+_REAL_PSQL_MAINT_STUB=""
+check "state reports the data as UNRESOLVED"  "$state" "unresolved"
+check "the breadcrumb is kept, not cleared" \
+  "$([[ -f "$BREADCRUMB" ]] && echo present || echo gone)" "present"
+aside17="$(cat "$WORK/aside")"
+check "no database named '$PG_DB' exists"    "$(db_exists "$PG_DB" && echo yes || echo no)" "no"
+check "the aside database still exists"      "$(db_exists "$aside17" && echo yes || echo no)" "yes"
+# It is deliberately left CLOSED: this branch suppresses _rds_cleanup so the data
+# stays exactly where it is for the human. That is precisely why the breadcrumb
+# and the printed recovery insist on BOTH statements — the rename alone would
+# leave every service failing with "is not currently accepting connections".
+check "the aside database is closed to connections (hence the 2-statement recovery)" \
+  "$(psql_maint -tAc "select datallowconn from pg_database where datname='$aside17'")" "f"
+# Follow the documented recovery and prove it actually gets production back.
+psql_maint -c "ALTER DATABASE \"$aside17\" RENAME TO \"$PG_DB\"" >/dev/null 2>&1
+psql_maint -c "ALTER DATABASE \"$PG_DB\" WITH ALLOW_CONNECTIONS true" >/dev/null 2>&1
+check "the documented recovery restores the data intact" "$(q 'select count(*) from users')" "10"
+rm -f "$BREADCRUMB"
+BREADCRUMB="$UPD_ROOT/.swap-in-progress"
 
 # ------------------------------------------------------------------ done --
 hdr "$( (( FAIL )) && echo "${C_RED}selftest: $FAIL failed, $PASS passed${C_OFF}" || echo "${C_GRN}selftest: all $PASS checks passed${C_OFF}")"

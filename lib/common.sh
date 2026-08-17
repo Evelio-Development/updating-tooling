@@ -575,8 +575,44 @@ sha_dir_manifest() {  # $1 = dir, $2... = relative files ; prints "sha  rel"
   done
 }
 
+# The only keys a release's meta.env may define. Anything else in the file is
+# ignored rather than executed.
+RELEASE_META_KEYS=(
+  RELEASE_ID RELEASE_KIND PREV_COMMIT RUNNING_COMMIT TARGET_COMMIT
+  DEPLOY_COMPLETED CREATED_AT HAS_DB_DUMP DB_DUMP_MODE
+  WITH_CADDY WITH_INGEST_DAEMON REVERTED_AT REVERTED_MODE
+)
+
+# Read the release metadata WITHOUT sourcing it.
+#
+# `source "$RELEASE_DIR/meta.env"` dropped every key in the file into the caller's
+# namespace, and meta.env records WITH_CADDY / WITH_INGEST_DAEMON. update.sh parses
+# its flags BEFORE calling this, so the previous release's values overwrote what
+# the operator actually typed — in both directions. Deploy once with --with-caddy
+# and every later plain `update.sh --apply` silently overwrote /etc/caddy/Caddyfile
+# from the repo and reloaded Caddy, forever, because each run wrote the inherited 1
+# straight back out. Conversely the first `--with-caddy` after a release without it
+# was reset to 0, the plan never mentioned Caddy, and step 11 never ran — the flag
+# was a no-op exactly when it was first used. That defeats "Caddy is opt-in".
+#
+# This is also the same hazard CLAUDE.md already insists on for frontend-build.env
+# ("a stray line in a sourced file could redefine WEBROOT or PG_DB") — meta.env is
+# machine-written, but it sits in a directory a human is invited to inspect and
+# repair, and one stray line was enough. Parse a whitelist, assign nothing else,
+# and execute nothing.
 load_release_meta() {
   [[ -f "$RELEASE_DIR/meta.env" ]] || return 1
-  # shellcheck disable=SC1091
-  source "$RELEASE_DIR/meta.env"
+  local line k v want
+  # Clear first, so a key absent from THIS release cannot be inherited from a
+  # previous load or from the ambient environment.
+  for k in "${RELEASE_META_KEYS[@]}"; do unset "$k"; done
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+    [[ "$line" == *=* ]] || continue
+    k="${line%%=*}"; v="${line#*=}"
+    for want in "${RELEASE_META_KEYS[@]}"; do
+      [[ "$k" == "$want" ]] && { printf -v "$k" '%s' "$v"; break; }
+    done
+  done < "$RELEASE_DIR/meta.env"
+  return 0
 }

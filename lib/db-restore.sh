@@ -415,10 +415,19 @@ _copy_database_level_state() {  # $1 = side db
            unnest(s.setconfig) cfg
       where d.datname='$PG_DB'" </dev/null 2>/dev/null || echo '')"
     if [[ -n "$stmts" ]]; then
-      while IFS= read -r s; do
+      # Read into an array FIRST, and give psql its own stdin. `psql_maint` is a
+      # `docker exec -i`, which drains the loop's here-string on the first
+      # iteration — so this loop used to apply statement #1, silently skip every
+      # other one, and leave `failed` at 0 so it reported success. Same bug class,
+      # and the same fix, as the row-count verification loop above; that one is
+      # called out in CLAUDE.md and this one was the copy that got missed.
+      # selftest.sh case 14 covers it.
+      local -a stmt_list=()
+      mapfile -t stmt_list <<<"$stmts"
+      for s in "${stmt_list[@]}"; do
         [[ -n "$s" ]] || continue
-        psql_maint -c "$s" >/dev/null 2>&1 || { warn "  failed: $s"; failed=1; }
-      done <<<"$stmts"
+        psql_maint -c "$s" </dev/null >/dev/null 2>&1 || { warn "  failed: $s"; failed=1; }
+      done
       (( failed )) && warn "some per-database settings were NOT copied onto the restored
        database (listed above) — re-apply them by hand after the swap."
     else

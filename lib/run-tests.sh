@@ -26,6 +26,11 @@ die() { printf '%sFAIL%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; exit 2; }
 REPO="${1:?usage: run-tests.sh <repo-dir>}"
 [[ -d "$REPO" ]] || die "no such repo dir: $REPO"
 
+# update.sh tightens $LOG_DIR at backup time, but this runs BEFORE that on the
+# very first deploy, and pytest output can carry fixture data. Own the mode here
+# rather than inheriting whatever umask the operator's shell had.
+mkdir -p "$LOG_DIR" && chmod 700 "$LOG_DIR" 2>/dev/null || true
+
 docker inspect "$STAGING_PG_CONTAINER" >/dev/null 2>&1 \
   || die "staging postgres container '$STAGING_PG_CONTAINER' not found.
        The test gate refuses to fall back to the prod container. Start staging and
@@ -46,24 +51,38 @@ spg postgres -c "CREATE DATABASE \"$TESTDB\" OWNER evelio" >/dev/null
 # Schema for the tests = the branch's own migrations, replayed in the SAME order
 # production gets them (add-order, not alphabetical — see migration_files()).
 #
-# A migration that does not apply is an INFRASTRUCTURE failure, not a test
-# failure, and it used to be a bare `warn`: the run carried on against a
-# schema-incomplete database, every test touching the missing tables errored in
-# collection, and update.sh blamed the app repo's tests. That is precisely the
-# exit-1-vs-exit-2 conflation this script exists to prevent, so it is exit 2.
+# This is BEST-EFFORT on purpose, and must not be fatal. The app repo's
+# migrations are not self-contained: nothing in migrate_*.sql creates the `users`
+# table (it exists only in production, predating them), so migrate_fleets.sql
+# cannot apply to an empty database in ANY order. Making a failed replay exit 2
+# therefore blocks every deploy forever, on a requirement that cannot be met — and
+# the tests do not actually need it: the files that touch the database build their
+# own schema.
+#
+# The original worry — that an incomplete schema makes tests die in collection and
+# get blamed on the app repo — is real, but it is handled properly further down:
+# a collection error is a pytest exit 2, which the classifier reports as DID NOT
+# RUN and turns into this script's exit 2. So the infrastructure/test distinction
+# is preserved without a gate nobody can pass.
 mapfile -t MIGRATIONS < <(migration_files "$REPO")
+mig_failed=()
 if (( ${#MIGRATIONS[@]} )); then
   for m in "${MIGRATIONS[@]}"; do
     [[ -f "$REPO/$m" ]] || continue
-    merr="$(spg "$TESTDB" < "$REPO/$m" 2>&1 >/dev/null)" || die "migration $m did not apply to the throwaway test database:
-       ${merr:-(no output)}
-       The test schema is therefore incomplete, and every test touching the
-       missing tables would report a collection error that looks like a failing
-       test. This is an infrastructure failure in the APP REPO's migrations —
-       they must apply cleanly, in add-order, to an empty database. Fix that
-       rather than deploying against an unverified suite."
+    merr="$(spg "$TESTDB" < "$REPO/$m" 2>&1 >/dev/null)" \
+      || mig_failed+=("$m: $(printf '%s' "${merr:-(no output)}" | grep -m1 -oE 'ERROR:.*' || printf 'failed')")
   done
-  ok "${#MIGRATIONS[@]} migration(s) applied to $TESTDB in add-order"
+  if (( ${#mig_failed[@]} )); then
+    warn "${#mig_failed[@]} of ${#MIGRATIONS[@]} migration(s) did not apply to $TESTDB:"
+    printf '       %s\n' "${mig_failed[@]}" >&2
+    log "  The test schema is therefore partial. This is NOT counted as a test"
+    log "  failure: the app repo's migrations are not self-contained (no migrate_*.sql"
+    log "  creates 'users'), and the database-touching tests build their own schema."
+    log "  If a test file dies in collection because of this, it is reported as"
+    log "  DID NOT RUN and exits 2 — infrastructure, not a regression."
+  else
+    ok "${#MIGRATIONS[@]} migration(s) applied to $TESTDB in add-order"
+  fi
 fi
 
 # ------------------------------------------------------------- test venv --
@@ -119,17 +138,28 @@ def _install():
         return
     _real = psycopg2.connect
 
-    def connect(*args, **kwargs):
+    def _check(args, kwargs):
         port = str(kwargs.get("port") or os.environ.get("PG_PORT") or "5432")
         db = (kwargs.get("dbname") or kwargs.get("database")
               or os.environ.get("PG_DB") or "evelio")
         host = str(kwargs.get("host") or os.environ.get("PG_HOST") or "localhost")
-        # A positional connection string must be PARSED, not substring-matched.
+        # A connection string must be PARSED, not substring-matched.
         # `psycopg2.connect("postgresql://evelio:pw@db.internal/evelio")` contains
         # no "5432" (the port is implicit) and no "dbname=", so the old check let
         # it through and then fell back to the *test* env values — which pass.
         # Parse both the URI and keyword/value forms, and fail closed.
-        dsn = args[0] if args and isinstance(args[0], str) else ""
+        #
+        # It must be taken from the KEYWORD form as well as the positional one.
+        # psycopg2's signature is connect(dsn=None, connection_factory=None, ...),
+        # so `connect(dsn="host=... port=5432 dbname=evelio")` put the string in
+        # kwargs, left dsn empty here, and fell back to the test env values — which
+        # pass. That reached the production socket; only a wrong password stopped
+        # it. Same class as the URI hole, one call-form over.
+        dsn = ""
+        if args and isinstance(args[0], str):
+            dsn = args[0]
+        elif isinstance(kwargs.get("dsn"), str):
+            dsn = kwargs["dsn"]
         if dsn:
             try:
                 if dsn.startswith(("postgres://", "postgresql://")):
@@ -154,10 +184,31 @@ def _install():
                 "port=%s db=%s host=%s.\n*** That is the PRODUCTION database. "
                 "Tests never talk to prod.\n\n" % (port, db, host))
             raise SystemExit(3)
+
+    def connect(*args, **kwargs):
+        _check(args, kwargs)
         return _real(*args, **kwargs)
 
     connect._evelio_guarded = True
     psycopg2.connect = connect
+
+    # psycopg2.extensions.connection is the underlying class and accepts the same
+    # DSN directly, so `extensions.connection("host=... port=5432 dbname=evelio")`
+    # bypassed a guard that only wrapped the module-level connect().
+    try:
+        import psycopg2.extensions as _ext
+        _real_conn = _ext.connection
+        if not getattr(_real_conn, "_evelio_guarded", False):
+            class _GuardedConnection(_real_conn):
+                _evelio_guarded = True
+
+                def __init__(self, *args, **kwargs):
+                    _check(args, kwargs)
+                    super().__init__(*args, **kwargs)
+
+            _ext.connection = _GuardedConnection
+    except Exception:
+        pass
 
 
 _install()
@@ -197,7 +248,31 @@ if [[ "$guard_rc" != "3" ]]; then
        $guard_rc, want 3). A URI naming a non-local host must be refused by the
        guard, not merely fail to connect."
 fi
-ok "prod-connection guard verified active (refused both a port-5432 connect and a remote URI)"
+# The two assertions above could not see a guard that reads the DSN only when it
+# arrives POSITIONALLY — and `connect(dsn=...)` is a perfectly ordinary call that
+# reached the production socket. Assert the keyword form explicitly, and the
+# underlying extensions.connection class, which takes the same string directly.
+guard_rc=0
+PG_HOST=127.0.0.1 PG_PORT=5433 PG_DB=notprod \
+"$TESTVENV/bin/python" -c \
+  'import psycopg2; psycopg2.connect(dsn="host=127.0.0.1 port=5432 dbname=evelio user=evelio")' \
+  >/dev/null 2>&1 || guard_rc=$?
+if [[ "$guard_rc" != "3" ]]; then
+  die "the prod-connection guard misses the dsn= KEYWORD form (got exit $guard_rc,
+       want 3). psycopg2.connect(dsn='…port=5432 dbname=evelio') must be refused:
+       that call reaches production, and only a wrong password would stop it."
+fi
+guard_rc=0
+PG_HOST=127.0.0.1 PG_PORT=5433 PG_DB=notprod \
+"$TESTVENV/bin/python" -c \
+  'import psycopg2.extensions as e; e.connection("host=127.0.0.1 port=5432 dbname=evelio user=evelio")' \
+  >/dev/null 2>&1 || guard_rc=$?
+if [[ "$guard_rc" != "3" ]]; then
+  die "the prod-connection guard does not cover psycopg2.extensions.connection
+       (got exit $guard_rc, want 3) — the class underneath connect() takes the same
+       DSN and would bypass a guard that only wraps the module-level function."
+fi
+ok "prod-connection guard verified active (port-5432 kwargs, remote URI, dsn= keyword, extensions.connection)"
 
 # ---------------------------------------------------------------- run it --
 # ONE PROCESS PER TEST FILE. The suite's modules stub each other in sys.modules
@@ -280,6 +355,7 @@ for t in "${TESTS[@]}"; do
     PGPASSWORD="$STAGING_PG_PASS" \
     PGHOST=127.0.0.1 PGPORT=5433 PGDATABASE="$TESTDB" PGUSER=evelio \
     JWT_SECRET=pretest-not-a-real-secret \
+    PG_CONTAINER="$STAGING_PG_CONTAINER" \
     TESLA_ENV_FILE=/dev/null TESLA_TOKEN_DIR="$UPD_ROOT/.testtokens" \
     "$TESTVENV/bin/python" -m pytest -q "$name" >"$LOG_DIR/test-$name.log" 2>&1 ) || trc=$?
   case "$trc" in
@@ -294,10 +370,6 @@ for t in "${TESTS[@]}"; do
        unrunnable+=("$name (pytest exit $trc)") ;;
   esac
 done
-
-# The caller decides what a FAILURE means; it may not decide what a file that
-# never ran means, so that is settled here.
-printf '%s\n' "${failed[@]}" | sed '/^$/d' | sort > "${RESULTS_FILE:-/dev/null}"
 
 if (( ${#unrunnable[@]} )); then
   log ""

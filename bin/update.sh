@@ -20,16 +20,16 @@ source "$HERE/lib/common.sh"
 
 APPLY=0
 SOFT_DB=0
-WITH_CADDY=0
-WITH_INGEST_DAEMON=0
+OPT_WITH_CADDY=0
+OPT_WITH_INGEST_DAEMON=0
 LOG_GATE=1
 
 while (( $# )); do
   case "$1" in
     --apply)              APPLY=1 ;;
     --soft-db-backup)     SOFT_DB=1 ;;
-    --with-caddy)         WITH_CADDY=1 ;;
-    --with-ingest-daemon) WITH_INGEST_DAEMON=1 ;;
+    --with-caddy)         OPT_WITH_CADDY=1 ;;
+    --with-ingest-daemon) OPT_WITH_INGEST_DAEMON=1 ;;
     --no-log-gate)        LOG_GATE=0 ;;
     --skip-tests)
       die "--skip-tests was removed. The test suite is a hard gate: a failing
@@ -178,7 +178,7 @@ if [[ -r "$PROD_ENV_FILE" ]]; then
   mapfile -t need < <(
     cd "$SRC_REPO" || exit 1
     cat "${FILES[@]}" 2>/dev/null \
-      | grep -oE "os\.environ\[['\"][A-Z_][A-Z0-9_]*['\"]\]|os\.getenv\(['\"][A-Z_][A-Z0-9_]*['\"]\s*\)" \
+      | grep -oE "os\.environ\[['\"][A-Z_][A-Z0-9_]*['\"]\]|os\.getenv\(['\"][A-Z_][A-Z0-9_]*['\"]\s*\)|os\.environ\.get\(['\"][A-Z_][A-Z0-9_]*['\"]\s*\)" \
       | grep -oE "[A-Z_][A-Z0-9_]{2,}" | sort -u
   )
   for k in "${need[@]}"; do
@@ -269,8 +269,8 @@ log "  migrations      : ${#MIGRATIONS[@]} (all replayed; they are idempotent)"
 (( ${#MIGRATIONS[@]} )) && printf '    %s\n' "${MIGRATIONS[@]}"
 log "  frontend        : npm build -> $WEBROOT (legal/ preserved)"
 log "  odometer script : fetch_odometer.py -> $INGEST_DIR"
-(( WITH_INGEST_DAEMON )) && log "  ingest daemon   : ingest_from_dockerlogs.py -> $INGEST_DIR (+ restart $INGEST_SERVICE)"
-(( WITH_CADDY )) && log "  caddy           : server-config/Caddyfile -> $CADDYFILE (backup, validate, reload)"
+(( OPT_WITH_INGEST_DAEMON )) && log "  ingest daemon   : ingest_from_dockerlogs.py -> $INGEST_DIR (+ restart $INGEST_SERVICE)"
+(( OPT_WITH_CADDY )) && log "  caddy           : server-config/Caddyfile -> $CADDYFILE (backup, validate, reload)"
 log "  cron            : stopped for the duration, restarted afterwards"
 log "  restart         : ${BACKEND_SERVICES[*]}"
 if (( SOFT_DB )); then
@@ -338,7 +338,7 @@ tar -tzf "$NEW_REL/frontend/webroot.tgz" >/dev/null || die "frontend snapshot do
 if [[ -f "$INGEST_DIR/fetch_odometer.py" ]]; then
   cp -a "$INGEST_DIR/fetch_odometer.py" "$NEW_REL/ingest/"
 fi
-(( WITH_INGEST_DAEMON )) && [[ -f "$INGEST_DIR/ingest_from_dockerlogs.py" ]] \
+(( OPT_WITH_INGEST_DAEMON )) && [[ -f "$INGEST_DIR/ingest_from_dockerlogs.py" ]] \
   && cp -a "$INGEST_DIR/ingest_from_dockerlogs.py" "$NEW_REL/ingest/"
 [[ -f "$CADDYFILE" ]] && cp -a "$CADDYFILE" "$NEW_REL/caddy/Caddyfile"
 
@@ -380,8 +380,11 @@ DEPLOY_COMPLETED=0
 CREATED_AT=$(date -u +%FT%TZ)
 HAS_DB_DUMP=1
 DB_DUMP_MODE=$DUMP_MODE
-WITH_CADDY=$WITH_CADDY
-WITH_INGEST_DAEMON=$WITH_INGEST_DAEMON
+# THIS deploy's intent, from the command line — not whatever the previous release
+# recorded. These keys are read back by revert.sh to decide whether the Caddyfile
+# and the ingest daemon are part of the snapshot it restores.
+WITH_CADDY=$OPT_WITH_CADDY
+WITH_INGEST_DAEMON=$OPT_WITH_INGEST_DAEMON
 EOF
 
 # Swap by two renames within one filesystem, so a complete release always
@@ -431,7 +434,7 @@ rollback_code() {
   warn "restoring $WEBROOT"
   restore_webroot "$RELEASE_DIR/frontend/webroot.tgz" || warn "webroot NOT restored — check it by hand"
 
-  if (( WITH_CADDY )) && [[ -f "$RELEASE_DIR/caddy/Caddyfile" ]]; then
+  if (( OPT_WITH_CADDY )) && [[ -f "$RELEASE_DIR/caddy/Caddyfile" ]]; then
     cp -a "$RELEASE_DIR/caddy/Caddyfile" "$CADDYFILE"
     caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1 \
       && systemctl reload caddy || warn "caddy rollback did not validate — check $CADDYFILE by hand"
@@ -520,7 +523,17 @@ on_failure() {
       # `exec 9<>` re-truncated the lock file and, once the child exited, nothing
       # held the lock at all while this process was still running.
       exec 9>&- 2>/dev/null || true
+      # Restore the default signal disposition before handing over. A signal set
+      # to SIG_IGN is INHERITED as ignored and a child cannot trap or reset it —
+      # so with `trap '' INT TERM HUP` still in force, every signal trap inside
+      # revert.sh and db-restore.sh is inert. The operator watching a multi-minute
+      # pg_restore would find Ctrl-C did nothing, escalate to kill -9, and SIGKILL
+      # skips `on_abort` as well: production left closed to connections with its
+      # services and cron down. The revert is designed to stay interruptible
+      # through the restore, and this is the one path that silently removed that.
+      trap - INT TERM HUP
       "$HERE/bin/revert.sh" --apply --db-only || warn "the database revert did not complete"
+      trap '' INT TERM HUP
       ;;
     3)
       warn "leaving production as-is at your request."
@@ -579,7 +592,22 @@ if ! grep -rqF "$VITE_API_BASE" "$DIST"; then
   die "the built bundle does not contain the prod API base '$VITE_API_BASE' —
        publishing it would point production at the wrong backend."
 fi
-if grep -rqE 'dev\.app\.evelio\.net|localhost:8[0-9]{3}' "$DIST"; then
+# grep exits 0=match, 1=no match, 2=ERROR. A bare `if grep …` treats 2 as "no
+# match" and passes — so an unreadable entry under dist/ (a broken symlink from a
+# plugin, an odd mode) makes this gate and the sitekey gate below wave the bundle
+# through. Dropping `2>/dev/null` earlier fixed the visibility of that, not the
+# logic. Require exactly 1 ("searched everything, found nothing") to pass.
+_grep_clean() {   # $@ = grep args ; 0 = definitely no match, non-zero = matched OR errored
+  local rc=0
+  grep "$@" || rc=$?
+  case "$rc" in
+    1) return 0 ;;
+    0) return 1 ;;
+    *) die "the bundle scan could not read part of $DIST (grep exit $rc).
+       Refusing to publish a bundle that was not fully checked." ;;
+  esac
+}
+if ! _grep_clean -rqE 'dev\.app\.evelio\.net|localhost:8[0-9]{3}' "$DIST"; then
   die "the built bundle references a dev/staging host — refusing to publish it to prod."
 fi
 # The 1x/2x/3x testing-sitekey check is applied to frontend-build.env during
@@ -587,7 +615,7 @@ fi
 # ships its own frontend/.env*, or reads a differently-named variable, a testing
 # sitekey reaches production while the gate says "bundle verified". Check the
 # artifact, which is the thing that actually gets published.
-if grep -rqE '"[123]x[A-Za-z0-9_-]{10,}"' "$DIST"; then
+if ! _grep_clean -rqE '"[123]x[A-Za-z0-9_-]{10,}"' "$DIST"; then
   die "the built bundle contains a Cloudflare TESTING Turnstile sitekey (1x/2x/3x…).
        That key always passes validation — publishing it disables the bot check on
        production. Check frontend/.env* in the app repo, not just frontend-build.env."
@@ -659,17 +687,40 @@ ok "${#FILES[@]} backend file(s) in place"
 
 hdr "9. Odometer script"
 STEP="deploy/ingest"
+# Write via a temp file and rename, exactly as the backend copy above does.
+# `sed … > "$INGEST_DIR/fetch_odometer.py"` truncates the LIVE file first, so a
+# signal or ENOSPC part-way through leaves a truncated script on the ingest host —
+# and root's crontab runs it every 15 minutes. The rename is atomic, so the file
+# is either the old one or the new one, never half of either. It also inherits the
+# source's mode, which the bare redirect only did when the target already existed
+# (a newly created fetch_odometer.py landed 0644, not executable).
+deploy_ingest_file() {   # $1 = filename
+  local f="$1" tmp="$INGEST_DIR/$1.deploying.$$"
+  DEPLOY_TMP="$tmp"
+  sed 's/\r$//' "$SRC_REPO/$f" > "$tmp" || { rm -f "$tmp"; DEPLOY_TMP=""; die "could not write $f"; }
+  chmod --reference="$SRC_REPO/$f" "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$INGEST_DIR/$f"
+  DEPLOY_TMP=""
+}
 if [[ -f "$SRC_REPO/fetch_odometer.py" ]]; then
-  sed 's/\r$//' "$SRC_REPO/fetch_odometer.py" > "$INGEST_DIR/fetch_odometer.py"
+  deploy_ingest_file fetch_odometer.py
   ok "fetch_odometer.py -> $INGEST_DIR (next cron run picks it up)"
   # MANIFEST.ingest is written once, below, covering every deployed ingest file.
 fi
-if (( WITH_INGEST_DAEMON )) && [[ -f "$SRC_REPO/ingest_from_dockerlogs.py" ]]; then
-  sed 's/\r$//' "$SRC_REPO/ingest_from_dockerlogs.py" > "$INGEST_DIR/ingest_from_dockerlogs.py"
+if (( OPT_WITH_INGEST_DAEMON )) && [[ -f "$SRC_REPO/ingest_from_dockerlogs.py" ]]; then
+  deploy_ingest_file ingest_from_dockerlogs.py
   chmod +x "$INGEST_DIR/ingest_from_dockerlogs.py"
   systemctl restart "$INGEST_SERVICE"
   ok "ingest_from_dockerlogs.py deployed, $INGEST_SERVICE restarted"
 fi
+# Same sweep the run-dir gets: an interrupt between the sed and the mv leaves a
+# <name>.deploying.<pid> that nothing else would ever clean up.
+shopt -s nullglob
+for stray in "$INGEST_DIR"/*.deploying.*; do
+  warn "removing leftover staging file from an interrupted deploy: $stray"
+  rm -f "$stray"
+done
+shopt -u nullglob
 # Fingerprint every ingest file this tool actually deploys, not just the odometer
 # script: MANIFEST.ingest used to record fetch_odometer.py alone, so a hand-fix in
 # ingest_from_dockerlogs.py passed the drift gate and was silently overwritten by
@@ -734,7 +785,7 @@ rm -rf "$NEWDIR"
 chmod -R a+rX "$WEBROOT"
 ok "published to $WEBROOT (legal/ preserved)"
 
-if (( WITH_CADDY )); then
+if (( OPT_WITH_CADDY )); then
   hdr "11. Caddy"
   STEP="deploy/caddy"
   if [[ -f "$SRC_REPO/server-config/Caddyfile" ]] && ! cmp -s "$SRC_REPO/server-config/Caddyfile" "$CADDYFILE"; then

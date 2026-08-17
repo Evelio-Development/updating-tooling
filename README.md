@@ -117,8 +117,9 @@ Read the diffs properly. Three things to look for:
 - **A file that differs because production has a hotfix that never reached
   `main`.** Stop and merge it first, or your first deploy silently reverts it.
 - **Files in `main` that were never deployed.** They will be added on the first
-  deploy. As of 2026-08-07 there are ten, including `build_charging_sessions.py`
-  and `soh_calculator.py` — the first deploy will be a big one.
+  deploy. As of 2026-08-17 there are **15** of the 39 deployable files, including
+  `build_charging_sessions.py`, `soh_calculator.py`, `charging_sessions.py` and
+  eight `migrate_*.sql` — the first deploy will be a big one.
 - **Files on the server that git has never heard of** (`recover_token.py`,
   `get_access_token*.sh`). These are never deleted, but they are also never
   updated. If they matter, get them into the app repo. The scan is recursive, so
@@ -138,8 +139,8 @@ need to revert. Merge the hand-edit into `main` instead.
 sudo lib/selftest.sh
 ```
 
-33 checks, about a minute, entirely inside the **staging** Postgres container on
-throwaway databases. See "Proving it works" below.
+56 checks, a couple of minutes, entirely inside the **staging** Postgres
+container on throwaway databases. See "Proving it works" below.
 
 ---
 
@@ -172,7 +173,8 @@ touched — but note step 4 has already replaced your previous backup:
    put a testing sitekey into production while the gate reported success.
 6. **cron is stopped** — three root cron jobs run code out of `/opt/tesla-oauth`
    and write to the database. Stopping the services is not enough.
-7. **Migrate** — every `migrate_*.sql`, before the code, always.
+7. **Migrate** — every `migrate_*.sql`, before the code, always, in the order
+   they were **added to the repo** (not alphabetically: they are not independent).
 8. **Backend code** → `/opt/tesla-oauth` (CRLF normalised), **odometer script** →
    `/opt/telemetry-ingest`, **frontend** → `/var/www/evelio-app`. The frontend is
    staged and then applied in a single `rsync` pass, so the webroot is never
@@ -355,7 +357,7 @@ back up.)
 
 `evelio_prerevert_<ts>` is **kept**. That is your undo-the-undo: the exact data
 production had a moment before the revert. `sudo bin/status.sh` lists these, and
-`--prune-aside` drops them once you are sure (about 6.5 GB each).
+`--prune-aside` drops them once you are sure (about 7.5 GB each).
 
 **`--prune-aside` is destructive and now behaves like it.** An
 `evelio_prerevert_*` database is not always the spare copy — mid-swap, or after a
@@ -395,8 +397,8 @@ the pre-deploy fingerprint.
 
 ### `--soft-db-backup`
 
-`telemetry_raw` is 6536 MB of the 6553 MB database; everything else — every user,
-fleet, vehicle, contract, session — is about 8 MB. A soft backup skips the
+`telemetry_raw` is 7498 MB of the 7515 MB database; everything else — every user,
+fleet, vehicle, contract, session — is about 17 MB. A soft backup skips the
 telemetry rows, so it is near-instant.
 
 The trade-off moves to revert time: the restored database has no telemetry, so
@@ -446,13 +448,27 @@ calls — against the staging Postgres on throwaway databases, and asserts:
 10. an aborted restore leaves the **caller's** `EXIT` trap intact, so production's
     services still get restarted;
 11. both databases accept connections again after a successful swap;
-12. a malformed row-count file is rejected rather than restored against.
+12. a malformed row-count file is rejected rather than restored against;
+13. an abort *before* the swap leaves no stale "swap in progress" breadcrumb;
+14. **every** per-database setting survives the swap, not just the first;
+15. a backup whose row counts cannot be trusted is never stored in the first place;
+16. a failed second rename puts the original database back, reopened;
+17. when the swap cannot be resolved, the breadcrumb is **kept** and the data is
+    intact under `evelio_prerevert_*`.
 
-33 checks, ~1 minute, never touches production. Run it after any change to the
-revert path. It has already caught five real bugs, including one where the
+56 checks, ~2 minutes, never touches production. Run it after any change to the
+revert path. It has already caught seven real bugs, including one where the
 verification that gates the swap was silently checking only the first table, one
-where soft-mode reverts silently discarded all NULL-`vin` telemetry, and one where
-every failed revert left production stopped without saying so.
+where soft-mode reverts silently discarded all NULL-`vin` telemetry, one where
+every failed revert left production stopped without saying so, and one where only
+the first per-database setting survived a revert.
+
+**A case that cannot fail is worse than no case.** Cases 12 and 13 originally
+passed against deliberately broken code — 12 tested the consumer while claiming
+to test the producer, and 13 only ever proved the breadcrumb gets *cleared*,
+never that it gets *kept*. Cases 15 and 17 exist because of that. When you add a
+case, break the guard it names in a copy of the repo and watch that specific
+check go red.
 
 ---
 
@@ -527,6 +543,29 @@ See step 2 of "First time here": `staging-db.pass`.
 **"found only N test file(s)"** — the runner found fewer than `MIN_TEST_FILES`
 test files. Either the checkout is incomplete or the app repo moved its tests. It
 refuses rather than reporting an empty suite as green.
+
+**"part of the test suite did not execute"** — one or more files reported `DID NOT
+RUN`: pytest collected nothing from them (exit 5), or they blew up before running
+(exit 2/3, typically a module-scope `sys.exit()`). They are **not** failing tests;
+they are files that assert nothing, so the gate has no verdict and exits 2. Fix
+them in the app repo by exposing pytest-collectable `test_*` functions, or remove
+them and lower `MIN_TEST_FILES` to match.
+
+**"N of M migration(s) did not apply"** — a warning, not a failure. The app repo's
+migrations are not self-contained (no `migrate_*.sql` creates `users`), and the
+database-touching tests build their own schema, so the replay is best-effort. If a
+test then dies in collection it is reported as `DID NOT RUN` and exits 2 —
+infrastructure, never a regression blamed on the app repo.
+
+**A deploy touched Caddy or the ingest daemon and you never asked it to** — this
+was a real bug, fixed. `meta.env` was `source`d into the caller's namespace and it
+records `WITH_CADDY`/`WITH_INGEST_DAEMON`, so the previous release's values
+overwrote the command line: one `--with-caddy` made *every* later deploy reinstall
+`/etc/caddy/Caddyfile` from the repo, and the first `--with-caddy` after a release
+without it was silently discarded. The metadata is now parsed against a whitelist
+and the operator's intent is held in separate variables. If you are on an older
+copy of this tool, check `grep WITH_CADDY releases/current/meta.env` before
+deploying.
 
 **A leftover `evelio_restore_*` database** — scratch from an interrupted revert.
 `bin/status.sh` shows it and whether anything is connected to it. It is never

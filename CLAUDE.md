@@ -55,7 +55,7 @@ lists that drive restore), `backend/` (pre-deploy code snapshot),
 | `bin/status.sh` | what's deployed, what the backup holds, drift, kept aside-databases, breadcrumbs. |
 | `lib/db-restore.sh` | `restore_db_swap()` — the database half of a revert, isolated so it can be rehearsed. |
 | `lib/run-tests.sh` | the test gate. Exits 0 / 1 (tests failed) / 2 (could not run). |
-| `lib/selftest.sh` | rehearses `restore_db_swap()` against the staging container. **Run it after touching anything in the revert path.** |
+| `lib/selftest.sh` | rehearses `restore_db_swap()` against the staging container. **Run it after touching anything in the revert path.** 56 checks; every case must be able to FAIL — see below. |
 
 ## Hard constraints for anyone (human or Claude) editing this repo
 
@@ -265,18 +265,43 @@ lists that drive restore), `backend/` (pre-deploy code snapshot),
   which the runner counted as a plain FAIL — so it exited 1 and `update.sh` told
   the operator to go fix tests in the app repo. `run-tests.sh` now proves it can
   reach the throwaway database with the credentials the tests will use, and exits
-  2 if it cannot. Some of the documented "9 of 14 failing" was this.
+  2 if it cannot. Some of the once-documented "9 of 14 failing" was this.
 - **The prod-connection guard must PARSE connection strings.** Substring-matching
   for `5432`/`dbname=evelio ` missed
   `psycopg2.connect("postgresql://evelio:pw@host/evelio")` entirely — no literal
   port, no `dbname=` — and then fell back to the *test* env values, which pass. It
   parses URI and keyword/value forms and fails closed, and the liveness assertion
   covers the URI form too, because the kwargs-only assertion could not see this gap.
+  Two further holes of the same shape were found later, and are why the assertions
+  now cover **four** call forms: the DSN was only read when it arrived
+  *positionally*, so `connect(dsn="host=… port=5432 dbname=evelio")` — psycopg2's
+  actual first parameter — sailed through and **reached the production socket**
+  (only a wrong password stopped it); and the guard wrapped only the module-level
+  `connect`, so `psycopg2.extensions.connection("…")`, the class underneath it,
+  took the same DSN and bypassed it entirely. Every new call form needs its own
+  assertion: the existing ones are structurally blind to the gap they do not name.
+- **The test env must redirect `PG_CONTAINER` too.** The guard is a Python-level
+  control and cannot see `subprocess`. `ingest_from_dockerlogs.py` defaults
+  `PG_CONTAINER` to the **prod** container and shells out to `docker exec … psql`,
+  so a test importing it would reach production around the guard entirely. The
+  per-file env block pins it to `$STAGING_PG_CONTAINER`.
+- **Replaying the app's migrations into the test database is BEST-EFFORT.** It
+  must not be fatal: nothing in `migrate_*.sql` creates the `users` table (it
+  predates them and exists only in production), so `migrate_fleets.sql` cannot
+  apply to an empty database in *any* order. Making a failed replay exit 2 blocked
+  every deploy on a requirement that cannot be satisfied — and the tests do not
+  need it, because the files that touch the database build their own schema. The
+  original worry (an incomplete schema making tests die in collection and get
+  blamed on the app repo) is handled properly instead: a collection error is a
+  pytest exit 2, which the per-file classifier reports as DID NOT RUN and turns
+  into this script's exit 2.
 - **It is strict and has no bypass.** A failing test is fixed or deleted in the
   app repo. `--skip-tests` was removed on purpose (the human's call): an escape
   hatch on a deploy gate gets used every time, and then the gate is decoration.
-  As of 2026-08-07, 9 of 14 test files fail on `main`, so this currently blocks
-  deploys — that is the intended pressure, not a bug in this tool.
+  As of 2026-08-17 the gate exits 2 on `main` — 7 of 14 files execute nothing and
+  2 hold genuine failures — so it currently blocks deploys. That is the intended
+  pressure, not a bug in this tool; see "Known upstream problems" for the real
+  breakdown, which is not the "9 of 14 failing" it was once recorded as.
 - **`run-tests.sh` distinguishes exit 1 (tests failed) from exit 2 (could not
   run).** Conflating them would let an infrastructure failure read as "nothing
   failed" and deploy on the strength of a suite that never ran.
@@ -296,10 +321,6 @@ lists that drive restore), `backend/` (pre-deploy code snapshot),
   it cannot prove the suite *runs*. The per-file classification above is what
   closes the rest of that gap — without it, fixing the two genuinely failing
   files would have turned the gate green while half of it asserted nothing.
-- **A migration that will not apply to the throwaway database is exit 2.** It was
-  a bare `warn`, so the run carried on against a schema-incomplete database and
-  every test touching the missing tables errored in collection — reported as
-  failing tests, blamed on the app repo. Infrastructure is infrastructure.
 - **The gate replays migrations in the SAME order production does.** Both callers
   now go through `migration_files()` in `lib/common.sh` (git add-order). The gate
   used to use a plain `migrate_*.sql` glob, i.e. alphabetical, so the schema it
@@ -317,6 +338,38 @@ lists that drive restore), `backend/` (pre-deploy code snapshot),
 
 ### General
 
+- **`meta.env` is PARSED, never sourced.** `load_release_meta` used to
+  `source` it, dropping every key into the caller's namespace — and `meta.env`
+  records `WITH_CADDY` / `WITH_INGEST_DAEMON`. `update.sh` parses its flags
+  *before* loading it, so the previous release's values overwrote what the
+  operator typed, in both directions: deploy once with `--with-caddy` and every
+  later plain `update.sh --apply` silently reinstalled `/etc/caddy/Caddyfile` from
+  the repo and reloaded Caddy, forever (each run wrote the inherited `1` back
+  out); conversely the first `--with-caddy` after a release without it was reset
+  to `0`, never appeared in the plan, and step 11 never ran — the flag was a no-op
+  exactly when first used. It now reads a **whitelist** of keys and executes
+  nothing, and the operator's intent lives in `OPT_WITH_*`, which no persisted key
+  can collide with. Same reasoning as parsing `VITE_*` out of the build config
+  instead of sourcing it.
+- **Never `docker exec -i` in the body of a `while read` loop.** It consumes the
+  loop's own stdin and the loop runs exactly once. This is documented for the
+  row-count verification loop; the *same bug* was live in
+  `_copy_database_level_state`, where it applied the first per-database setting,
+  silently skipped the rest, and left `failed=0` so the swap reported success.
+  Read into an array first **and** give the inner command `</dev/null`.
+  `selftest.sh` case 14 covers it.
+- **A signal set to `SIG_IGN` is inherited and cannot be trapped or reset by a
+  child.** `update.sh`'s failure handler blocks INT/TERM/HUP around the rollback
+  prompt, and then hands over to `revert.sh --apply --db-only` — so every signal
+  trap in `revert.sh` and `db-restore.sh` was inert on that path. Ctrl-C during a
+  multi-minute `pg_restore` did nothing, and the operator's next move is `kill -9`,
+  which skips `on_abort` too: production left closed to connections with its
+  services and cron down. The handover now restores the default disposition first.
+- **`grep` exits 2 on ERROR, and `if grep …` treats that as "no match".** Both
+  bundle gates (dev-host, testing sitekey) passed vacuously if anything under
+  `dist/` was unreadable. Removing `2>/dev/null` fixed the *visibility* of that,
+  not the logic. They now require exit 1 — "searched everything, found nothing" —
+  and die on anything else.
 - **Never commit** a rendered `frontend-build.env`, a dump, a release dir, or any
   secret. Only the template is tracked. The tool reads the *names* of env keys
   from `/etc/tesla-oauth.env` for its pre-flight check, never their values, and
@@ -415,6 +468,34 @@ These are the app repo's to fix, not this one's:
    until a lockfile is committed.
 4. **The run-dir holds CRLF files and server-only scripts** (`recover_token.py`,
    `get_access_token*.sh`) that git has never seen.
+
+## A selftest case that cannot fail is worse than no case
+
+Prove every new case detects the regression it names — break the guard in a copy
+of the repo and watch that specific check go red. Three cases here did not, and
+each looked entirely convincing:
+
+- **Case 12** claimed to cover "rowcounts.pre must never be *stored* containing
+  psql error text" — the sentinel and line-format guards in
+  `dump_and_count_consistently`. It never called that function: it hand-wrote a
+  bad file and fed it to `restore_db_swap`, which rejects it as an ordinary
+  row-count mismatch. Deleting **both** producer guards left the suite green.
+  Case 15 now drives the producer directly.
+- **Case 13** proved the breadcrumb is *cleared* on three paths but never that it
+  is *kept*. Deleting the `RDS_DB_STATE="unresolved"` transition — the only thing
+  that retains the breadcrumb when production's data is under
+  `evelio_prerevert_*` and no `evelio` exists — left the suite green. Case 17 now
+  forces both renames to fail and asserts the other direction.
+- **`_copy_database_level_state`** had no coverage at all, which is exactly why a
+  known, already-documented bug class was sitting live in it. Case 14 covers it.
+
+Two harness traps worth knowing, both of which produced confidently wrong
+results here: `restore_db_swap` runs in a **subshell** in several cases (so
+`die()` fails the case, not the harness), which means `ASIDE_DB` does not
+propagate back — read it from the file the trap writes, never from the parent's
+stale copy, or the assertion silently inspects the *previous* case's database.
+And to force a specific branch, stub `psql_maint` for the exact statement under
+test; racing a real rename is not reproducible.
 
 ## Relationship to the staging tooling
 

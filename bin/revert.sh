@@ -159,7 +159,11 @@ if (( ! CODE_ONLY )); then
   # Tables that existed at backup time and do not exist now come BACK.
   while IFS='|' read -r t c; do
     [[ -n "$t" ]] || continue
-    grep -q "^$t|" "$tmpnow" || { lost_any=1; printf '  %-38s %12s %12s %11s\n' "$t" "-" "$c" "RECREATED"; }
+    # Exact field match, not a regex: a table name is `schema.table`, and `.`
+    # matches any character, so public.users would match a line publicXusers|…
+    # and the table would be silently dropped from the "RECREATED" report.
+    awk -F'|' -v k="$t" '$1==k{f=1} END{exit !f}' "$tmpnow" \
+      || { lost_any=1; printf '  %-38s %12s %12s %11s\n' "$t" "-" "$c" "RECREATED"; }
   done < "$RELEASE_DIR/rowcounts.pre"
   rm -f "$tmpnow"
   (( lost_any )) || log "  (no row-count changes since the backup)"
@@ -233,11 +237,26 @@ if (( ! CODE_ONLY )); then
 fi
 
 # =================================================== 5. STOP THE WRITERS ====
+# Both refusal paths below return before resume_cron, deliberately: cron's jobs
+# connect to the prod database and run code out of $BACKEND_DIR, so starting them
+# against a missing or closed database just produces failing jobs. But leaving
+# cron stopped SILENTLY is its own outage — root's crontab is what runs
+# run_outage_check.sh every 15 minutes and run_notifier.sh hourly, so the thing
+# that would tell you production is unhealthy is itself switched off. Say so.
+_warn_cron_still_stopped() {
+  (( CRON_WAS_ACTIVE )) || return 0
+  warn "cron is STILL STOPPED — the outage checker and the notifier are not running."
+  log "  Start it once the database is right, together with the services:"
+  log "      systemctl start ${BACKEND_SERVICES[*]} $INGEST_SERVICE cron"
+  return 0
+}
+
 restart_all() {
   if ! db_exists "$PG_DB"; then
     warn "NOT starting the services: there is no database named '$PG_DB'."
     log "  Your data is intact under an evelio_prerevert_* database. Put it back"
     log "  before starting anything — see $BREADCRUMB."
+    _warn_cron_still_stopped
     return 1
   fi
   # Existing is not the same as reachable. The swap sets ALLOW_CONNECTIONS false
@@ -250,6 +269,7 @@ restart_all() {
     log "  The restored data IS in place. Reopen it first, then start them:"
     log "      docker exec -i $PG_CONTAINER psql -U $PG_USER -d postgres \\"
     log "        -c 'ALTER DATABASE \"$PG_DB\" WITH ALLOW_CONNECTIONS true'"
+    _warn_cron_still_stopped
     return 1
   fi
   local u
