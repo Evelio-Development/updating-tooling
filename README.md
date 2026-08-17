@@ -51,11 +51,34 @@ sudo chmod 600 /opt/evelio-updating/frontend-build.env
 sudo nano /opt/evelio-updating/frontend-build.env
 ```
 
-You need the **real, domain-locked** Turnstile sitekey — the one used on
-`app.evelio.net`. The tool refuses to build if it is missing, or if it looks like
-one of Cloudflare's testing keys (`1x…`, `2x…`, `3x…`), which the staging tooling
-uses on purpose. A testing key in a production bundle means the captcha verifies
-nothing.
+**Production is its own source of truth here.** Both values are baked into the
+bundle that `$WEBROOT` is serving right now, so if this file is ever lost you
+recover it rather than guess:
+
+```bash
+# the API base and the Turnstile sitekey currently in production
+grep -rhoE 'https://[a-z0-9.-]*evelio\.net/api/v1' /var/www/evelio-app | sort -u
+grep -rhoE '0x[A-Za-z0-9_-]{10,}'                  /var/www/evelio-app | sort -u
+```
+
+The Turnstile **site** key is public by design — it ships to every browser — which
+is why it is recoverable this way. The *secret* key is not in the bundle, is not
+recoverable this way, and is not this tool's business.
+
+Two traps:
+
+- **`VITE_API_BASE` is on `evelio.net`, not `app.evelio.net`.** Caddy's
+  `app.evelio.net` block is `root /var/www/evelio-app` + `try_files {path}
+  /index.html` with no `reverse_proxy`, so an API base pointed there answers every
+  call with `index.html` and a **200**. The frontend is then completely broken
+  while nothing reports an error, and the bundle gate cannot catch it — that gate
+  only proves the bundle contains the base you passed *in*. The correct value,
+  `https://evelio.net/api/v1`, is what the template now ships and what the app
+  itself defaults to in `frontend/src/lib.js`.
+- **The sitekey must be the real, domain-locked one.** The tool refuses to build
+  if it is missing or looks like one of Cloudflare's testing keys (`1x…`, `2x…`,
+  `3x…`), which the staging tooling uses on purpose. A testing key in a production
+  bundle means the captcha verifies nothing.
 
 ### 2. Give the test gate the staging database password
 
@@ -164,6 +187,16 @@ touched — but note step 4 has already replaced your previous backup:
 Only after verification passes does the tool record that production is running
 the new commit.
 
+The HTTP probes are `https://evelio.net/health` and
+`https://evelio.net/api/v1/vehicle-brands`, and both must return 2xx **with a
+non-HTML content-type**. That last condition is not fussiness: the probe used to
+be `https://app.evelio.net/api/v1/health`, and because `app.evelio.net` is static
+with a `try_files … /index.html` fallback, it answered `200 text/html` — so it
+passed unconditionally and would have gone on passing with the backend stopped.
+An HTML body on an API path means the static fallback served it and the request
+never reached the application. (`/api/v1/health` does not exist; the app mounts
+`/health` at the root, so proving the `/api/v1` prefix needs a real route.)
+
 ### Flags
 
 | flag | effect |
@@ -205,28 +238,54 @@ Things worth knowing:
   legitimately has fewer test files, lower that number in `lib/run-tests.sh` —
   deliberately, as an edit someone reviews.
 - **Exit 1 means tests failed; exit 2 means they could not run.** Anything
-  environmental — no staging container, an unreachable test database, a dead guard
-  — is exit 2 and never reads as "nothing failed".
+  environmental — no staging container, an unreachable test database, a dead
+  guard, a migration that will not apply to the throwaway database — is exit 2 and
+  never reads as "nothing failed".
+- **That applies per file, too.** pytest exit `1` is a real failure, but `5`
+  (collected no tests), `2`/`3` (INTERNALERROR) and `4` (usage) mean the file
+  never ran. Those are reported as `DID NOT RUN`, not `FAIL`, and any of them
+  makes the whole gate exit 2 — even alongside genuine failures, because a suite
+  that partly did not execute has no verdict to give. `MIN_TEST_FILES` counts
+  files; this counts whether they actually ran.
+- **Migrations are replayed in the order production replays them** (git
+  add-order, via `migration_files()` in `lib/common.sh`), not alphabetically.
+  They are not independent, so the two orders build different schemas.
 
-**As of 2026-08-07, 9 of the app's 14 test files fail on `main`** and therefore
-block deploys until they are dealt with:
+**As of 2026-08-17 the gate exits 2 on `main`: it cannot give a verdict.** There
+are two independent reasons, and neither is "nine tests are broken" — that older
+reading counted files that never executed as failures.
+
+**1. The throwaway test database cannot be built.** `migrate_fleets.sql` needs a
+`users` table that no `migrate_*.sql` in the app repo creates, in either replay
+order. Production already has `users`, so deploys are unaffected — but the gate
+stops here until the app repo's migrations apply cleanly to an empty database.
+
+**2. Seven of the 14 files assert nothing.** They are standalone
+`python3 test_x.py` scripts rather than pytest modules:
 
 ```
-test_combined_fleet_driver.py   test_fleet_master_link.py
-test_fleet_naming.py            test_fleet_onboarding.py
-test_fleet_pending_members.py   test_nonfleet_onboarding.py
-test_notify_outage_integration.py  test_outage_detector.py
-test_repush_active.py
+no tests collected (pytest exit 5)      module-scope sys.exit() (INTERNALERROR)
+  test_combined_fleet_driver.py           test_fleet_naming.py
+  test_fleet_master_link.py               test_fleet_pending_members.py
+  test_fleet_onboarding.py
+  test_nonfleet_onboarding.py
+  test_repush_active.py
 ```
 
-Some are genuine assertion failures (`test_outage_detector.py` disagrees with
-`outage_detector.classify`), others need setup the suite does not do. Per-file
-output is in `/opt/evelio-updating/logs/test-*.log`.
+Both INTERNALERROR files exit **0** — they run their own checks and pass, and the
+old gate recorded them as failing tests. They need pytest-collectable `test_*`
+functions (or removal from the repo, with `MIN_TEST_FILES` lowered to match).
 
-Two of those files (`test_fleet_naming.py` among them) were failing only because
-the gate was using the wrong staging password — they never ran at all. Set up
-`staging-db.pass` (step 2 above) before judging the list; the gate now stops with
-an explicit infrastructure error instead of blaming the app repo.
+**Only two files hold genuine failures**, and all three assertions are about
+outage severity classification — one behaviour change, not nine:
+`test_outage_detector.py` (1 of 17) and `test_notify_outage_integration.py`
+(2 of 10). `outage_detector.classify({"total_eligible": 4, "silent_count": 2})`
+returns `healthy` where the tests expect `partial`.
+
+Per-file output is in `/opt/evelio-updating/logs/test-*.log`. Set up
+`staging-db.pass` (step 2 above) before judging any of this — a wrong password
+makes every database-touching file fail for reasons that have nothing to do with
+the app repo, which is why that case is its own exit-2 error.
 
 ### If a deploy fails
 
@@ -437,6 +496,12 @@ certain the other run is dead: `sudo fuser -k /opt/evelio-updating/.lock`.
 `/opt/evelio-updating/.swap-in-progress` contains the exact recovery command.
 Your data is intact under an `evelio_prerevert_*` database. Both scripts refuse
 to run until you resolve it and delete that file.
+
+This message means what it says: a revert that aborts *before* the swap — a
+failed `pg_restore`, a row-count mismatch, a corrupt dump, a failed telemetry
+carry-over — removes the breadcrumb on its way out, because production was never
+touched. If you see it, the swap really did reach the rename window. Do not get
+into the habit of deleting that file.
 
 **"no database named evelio exists"** — the same situation. Do **not** start the
 services, and do **not** run `--prune-aside` (it will refuse, but do not try):

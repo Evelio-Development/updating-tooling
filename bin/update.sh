@@ -262,8 +262,9 @@ if (( ${#REMOVING[@]} )); then
   printf '    %s\n' "${REMOVING[@]}"
 fi
 
-mapfile -t MIGRATIONS < <(cd "$SRC_REPO" && git log --diff-filter=A --format='%H' --reverse -- 'migrate_*.sql' \
-  | while read -r c; do git show --name-only --format='' --diff-filter=A "$c" -- 'migrate_*.sql'; done | awk '!seen[$0]++')
+# Add-order, not alphabetical: the migrations are not independent. Shared with
+# run-tests.sh so the gate builds its schema exactly the way production gets it.
+mapfile -t MIGRATIONS < <(migration_files "$SRC_REPO")
 log "  migrations      : ${#MIGRATIONS[@]} (all replayed; they are idempotent)"
 (( ${#MIGRATIONS[@]} )) && printf '    %s\n' "${MIGRATIONS[@]}"
 log "  frontend        : npm build -> $WEBROOT (legal/ preserved)"
@@ -446,7 +447,14 @@ rollback_code() {
   for _f in fetch_odometer.py ingest_from_dockerlogs.py; do
     [[ -f "$INGEST_DIR/$_f" ]] && _rbi+=("$_f")
   done
-  (( ${#_rbi[@]} )) && sha_dir_manifest "$INGEST_DIR" "${_rbi[@]}" > "$RELEASE_DIR/MANIFEST.ingest"
+  # An `if`, not `(( n )) && cmd`: a function whose last executed statement is a
+  # false `&&` guard RETURNS non-zero, and under `set -e` that kills the caller at
+  # the point of the call. This is the rollback path, so an accidental exit here
+  # would abandon production half-rolled-back. Nothing currently sits at the tail
+  # of this function, but nothing should have to check that before adding a line.
+  if (( ${#_rbi[@]} )); then
+    sha_dir_manifest "$INGEST_DIR" "${_rbi[@]}" > "$RELEASE_DIR/MANIFEST.ingest"
+  fi
 
   systemctl restart "${BACKEND_SERVICES[@]}" || true
   resume_cron

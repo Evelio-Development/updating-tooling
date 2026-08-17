@@ -43,12 +43,28 @@ trap cleanup EXIT
 info "creating throwaway test db $TESTDB in $STAGING_PG_CONTAINER"
 spg postgres -c "CREATE DATABASE \"$TESTDB\" OWNER evelio" >/dev/null
 
-# Schema for the tests = the branch's own migrations (idempotent by convention).
-shopt -s nullglob
-for m in "$REPO"/migrate_*.sql; do
-  spg "$TESTDB" < "$m" >/dev/null 2>&1 || warn "migration $(basename "$m") did not apply cleanly to the test db"
-done
-shopt -u nullglob
+# Schema for the tests = the branch's own migrations, replayed in the SAME order
+# production gets them (add-order, not alphabetical — see migration_files()).
+#
+# A migration that does not apply is an INFRASTRUCTURE failure, not a test
+# failure, and it used to be a bare `warn`: the run carried on against a
+# schema-incomplete database, every test touching the missing tables errored in
+# collection, and update.sh blamed the app repo's tests. That is precisely the
+# exit-1-vs-exit-2 conflation this script exists to prevent, so it is exit 2.
+mapfile -t MIGRATIONS < <(migration_files "$REPO")
+if (( ${#MIGRATIONS[@]} )); then
+  for m in "${MIGRATIONS[@]}"; do
+    [[ -f "$REPO/$m" ]] || continue
+    merr="$(spg "$TESTDB" < "$REPO/$m" 2>&1 >/dev/null)" || die "migration $m did not apply to the throwaway test database:
+       ${merr:-(no output)}
+       The test schema is therefore incomplete, and every test touching the
+       missing tables would report a collection error that looks like a failing
+       test. This is an infrastructure failure in the APP REPO's migrations —
+       they must apply cleanly, in add-order, to an empty database. Fix that
+       rather than deploying against an unverified suite."
+  done
+  ok "${#MIGRATIONS[@]} migration(s) applied to $TESTDB in add-order"
+fi
 
 # ------------------------------------------------------------- test venv --
 PROD_SITE="$(ls -d "$BACKEND_DIR"/.venv/lib/python*/site-packages 2>/dev/null | head -1)"
@@ -238,27 +254,66 @@ fi
 ok "staging test database reachable with the test credentials"
 
 info "pytest — ${#TESTS[@]} test file(s), one process each"
-failed=()
+# pytest's exit code says WHICH of the two things happened, and the distinction is
+# the whole point of this script's 1-vs-2 contract:
+#
+#   0  all collected tests passed
+#   1  tests ran and some FAILED            -> a real regression signal, exit 1
+#   2  interrupted / INTERNALERROR          -> the file never ran, exit 2
+#   3  internal error                       -> the file never ran, exit 2
+#   4  usage error                          -> the file never ran, exit 2
+#   5  NO TESTS COLLECTED                   -> the file never ran, exit 2
+#
+# Counting 2/3/4/5 as "FAIL" was the same conflation the STAGING_PG_PASS check
+# exists to prevent, one level down: update.sh printed "fix or delete the failing
+# tests in the app repo" about files in which nothing failed because nothing ran.
+# Exit 5 in particular is how a file that is a standalone `python3 test_x.py`
+# script rather than a pytest module reports itself, and exit 2 is what a
+# module-scope sys.exit() produces — a file that ran its own checks, passed them,
+# and exited 0 was still recorded as a failing test.
+failed=(); unrunnable=()
 for t in "${TESTS[@]}"; do
   name="$(basename "$t")"
-  if ( cd "$REPO" && \
-       PG_HOST=127.0.0.1 PG_PORT=5433 PG_DB="$TESTDB" PG_USER=evelio PG_PASS="$STAGING_PG_PASS" \
-       PGPASSWORD="$STAGING_PG_PASS" \
-       PGHOST=127.0.0.1 PGPORT=5433 PGDATABASE="$TESTDB" PGUSER=evelio \
-       JWT_SECRET=pretest-not-a-real-secret \
-       TESLA_ENV_FILE=/dev/null TESLA_TOKEN_DIR="$UPD_ROOT/.testtokens" \
-       "$TESTVENV/bin/python" -m pytest -q "$name" >"$LOG_DIR/test-$name.log" 2>&1 )
-  then
-    printf '  %-46s %sPASS%s\n' "$name" "$C_GRN" "$C_OFF"
-  else
-    printf '  %-46s %sFAIL%s\n' "$name" "$C_RED" "$C_OFF"
-    failed+=("$name")
-  fi
+  trc=0
+  ( cd "$REPO" && \
+    PG_HOST=127.0.0.1 PG_PORT=5433 PG_DB="$TESTDB" PG_USER=evelio PG_PASS="$STAGING_PG_PASS" \
+    PGPASSWORD="$STAGING_PG_PASS" \
+    PGHOST=127.0.0.1 PGPORT=5433 PGDATABASE="$TESTDB" PGUSER=evelio \
+    JWT_SECRET=pretest-not-a-real-secret \
+    TESLA_ENV_FILE=/dev/null TESLA_TOKEN_DIR="$UPD_ROOT/.testtokens" \
+    "$TESTVENV/bin/python" -m pytest -q "$name" >"$LOG_DIR/test-$name.log" 2>&1 ) || trc=$?
+  case "$trc" in
+    0) printf '  %-46s %sPASS%s\n' "$name" "$C_GRN" "$C_OFF" ;;
+    1) printf '  %-46s %sFAIL%s\n' "$name" "$C_RED" "$C_OFF"
+       failed+=("$name") ;;
+    5) printf '  %-46s %sDID NOT RUN%s  (pytest collected no tests)\n' "$name" "$C_YEL" "$C_OFF"
+       unrunnable+=("$name (no tests collected — not a pytest module?)") ;;
+    2|3) printf '  %-46s %sDID NOT RUN%s  (pytest internal error)\n' "$name" "$C_YEL" "$C_OFF"
+       unrunnable+=("$name (pytest INTERNALERROR — module-scope sys.exit()?)") ;;
+    *) printf '  %-46s %sDID NOT RUN%s  (pytest exit %s)\n' "$name" "$C_YEL" "$C_OFF" "$trc"
+       unrunnable+=("$name (pytest exit $trc)") ;;
+  esac
 done
 
-# The caller decides what a failure MEANS (see update.sh: it is a regression
-# gate, not a pass/fail gate — much of this suite has been red for a while).
+# The caller decides what a FAILURE means; it may not decide what a file that
+# never ran means, so that is settled here.
 printf '%s\n' "${failed[@]}" | sed '/^$/d' | sort > "${RESULTS_FILE:-/dev/null}"
+
+if (( ${#unrunnable[@]} )); then
+  log ""
+  warn "${#unrunnable[@]}/${#TESTS[@]} test file(s) did NOT run at all:"
+  printf '       %s\n' "${unrunnable[@]}" >&2
+  (( ${#failed[@]} )) && printf '       (%s other file(s) ran and failed: %s)\n' \
+       "${#failed[@]}" "${failed[*]}" >&2
+  # Exit 2 even when some files also genuinely failed: if part of the gate did not
+  # execute, its green files do not add up to a verdict, and "some tests failed"
+  # would understate that.
+  die "part of the test suite did not execute, so the gate has no verdict to give.
+       These files assert nothing at present — a green run would not mean what it
+       says. Each needs to expose pytest-collectable test_* functions in the app
+       repo (or be removed from it, and MIN_TEST_FILES lowered to match).
+       Logs: $LOG_DIR/test-*.log"
+fi
 
 if (( ${#failed[@]} )); then
   warn "${#failed[@]}/${#TESTS[@]} test file(s) failed (logs in $LOG_DIR/test-*.log)"

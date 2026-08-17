@@ -240,6 +240,18 @@ restart_all() {
     log "  before starting anything — see $BREADCRUMB."
     return 1
   fi
+  # Existing is not the same as reachable. The swap sets ALLOW_CONNECTIONS false
+  # and BOTH renames carry that property with the name, so a swap that completed
+  # but could not reopen leaves a correctly-named database that refuses every
+  # client. Starting the services against it produces a crash-loop whose cause is
+  # nowhere in their logs.
+  if [[ "$(psql_maint -tAc "select datallowconn from pg_database where datname='$PG_DB'" </dev/null 2>/dev/null)" == "f" ]]; then
+    warn "NOT starting the services: '$PG_DB' exists but is closed to connections."
+    log "  The restored data IS in place. Reopen it first, then start them:"
+    log "      docker exec -i $PG_CONTAINER psql -U $PG_USER -d postgres \\"
+    log "        -c 'ALTER DATABASE \"$PG_DB\" WITH ALLOW_CONNECTIONS true'"
+    return 1
+  fi
   local u
   for u in "${STOPPED[@]}"; do systemctl start "$u" || warn "could not start $u"; done
   resume_cron
@@ -254,6 +266,20 @@ on_abort() {
   # deliberately installs no EXIT trap of its own (it would displace this one,
   # and this is the only thing that restarts the services stopped below).
   declare -F _rds_cleanup >/dev/null && _rds_cleanup || true
+  # The breadcrumb is written before the restore begins, but almost every abort
+  # happens in the long pre-swap phase (pg_restore, verification, telemetry
+  # carry-over) where production was never touched. Leaving it behind then blocks
+  # the next update.sh/revert.sh/--prune-aside with "an earlier database swap did
+  # not finish" and sends the operator hunting for evelio_prerevert_* databases
+  # that were never created. Clear it when the library says the data's location is
+  # known; keep it — and say so — when it is not. (A crash so hard that this trap
+  # never runs also leaves it in place, which is exactly right.)
+  if [[ "${RDS_DB_STATE:-safe}" == "safe" ]]; then
+    breadcrumb_clear
+  else
+    warn "the database swap did not resolve — $BREADCRUMB has been LEFT IN PLACE."
+    log "  Read it before running anything else: it names the database holding your data."
+  fi
   warn "revert aborted (rc=$rc) — restarting services"
   restart_all || true
   exit "$rc"
@@ -309,7 +335,10 @@ if (( ! DB_ONLY )); then
   for _f in fetch_odometer.py ingest_from_dockerlogs.py; do
     [[ -f "$INGEST_DIR/$_f" ]] && _ri+=("$_f")
   done
-  (( ${#_ri[@]} )) && sha_dir_manifest "$INGEST_DIR" "${_ri[@]}" > "$RELEASE_DIR/MANIFEST.ingest"
+  # `if`, not `(( n )) && cmd` — see the matching note in update.sh's rollback_code.
+  if (( ${#_ri[@]} )); then
+    sha_dir_manifest "$INGEST_DIR" "${_ri[@]}" > "$RELEASE_DIR/MANIFEST.ingest"
+  fi
 
   info "restoring $WEBROOT"
   if restore_webroot "$RELEASE_DIR/frontend/webroot.tgz"; then

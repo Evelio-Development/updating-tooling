@@ -65,6 +65,32 @@ backend_deploy_files() {   # $1 = repo dir ; prints relative paths
     | grep -Ev '^(fetch_odometer\.py|ingest_from_dockerlogs\.py)$'
 }
 
+# Migrations, in the order they were ADDED to the repo — which is the order they
+# must be replayed in, because they are not independent (migrate_fleets.sql
+# expects a `users` table that an earlier one is responsible for).
+#
+# This lives here because BOTH update.sh (replaying against production) and
+# run-tests.sh (building the throwaway test database) need it, and they used to
+# derive it separately: update.sh from git history, run-tests.sh from a plain
+# `migrate_*.sql` glob, i.e. alphabetically. So the schema the gate tested against
+# was assembled in a different order from the one production gets — the gate was
+# not testing the deploy's own behaviour. One definition, two callers.
+migration_files() {   # $1 = repo dir ; prints relative paths, in replay order
+  local repo="$1"
+  if [[ -d "$repo/.git" ]] && git -C "$repo" rev-parse HEAD >/dev/null 2>&1; then
+    git -C "$repo" log --diff-filter=A --format='%H' --reverse -- 'migrate_*.sql' \
+      | while read -r c; do
+          git -C "$repo" show --name-only --format='' --diff-filter=A "$c" -- 'migrate_*.sql'
+        done | awk '!seen[$0]++'
+  else
+    # Not a git checkout: fall back to alphabetical, and be honest that the order
+    # is a guess rather than the one production will use.
+    warn "$repo is not a git checkout — falling back to ALPHABETICAL migration order,
+       which is not necessarily the order production replays them in."
+    ( cd "$repo" && shopt -s nullglob && printf '%s\n' migrate_*.sql )
+  fi
+}
+
 # Files/dirs in $BACKEND_DIR that this tool must NEVER mirror, delete, or treat
 # as drift. These are live runtime state, secrets, or human rollback material.
 PROTECTED=(
@@ -450,17 +476,35 @@ check_services_stayed_up() {
 }
 
 check_http() {
-  local bad=0 code
-  # These two are UNAUTHENTICATED health endpoints, so only 2xx means healthy. A
-  # 404 here means the route is gone or the wrong router is mounted — i.e. exactly
-  # the regression this gate exists to catch. (The lenient 401/403/404 reasoning
-  # applies to arbitrary API paths, not to a health probe.)
-  for url in https://evelio.net/health https://app.evelio.net/api/v1/health; do
-    code="$(curl -sS -o /dev/null -m 15 -w '%{http_code}' "$url" 2>/dev/null || echo 000)"
-    if [[ "$code" =~ ^(200|204)$ ]]; then
-      ok "HTTP $url -> $code"
-    else
+  local bad=0 code ct out
+  # Both are UNAUTHENTICATED endpoints on the API host, so only 2xx means healthy.
+  # A 404 means the route is gone or the wrong router is mounted — exactly the
+  # regression this gate exists to catch. (The lenient 401/403/404 reasoning
+  # applies to arbitrary API paths, not to these.)
+  #
+  # The API lives on evelio.net, NOT on app.evelio.net: Caddy's app.evelio.net
+  # block is `root /var/www/evelio-app` plus `try_files {path} /index.html` and has
+  # no reverse_proxy at all. This probe used to be
+  # https://app.evelio.net/api/v1/health, which that SPA fallback answers with
+  # index.html and **200** — so it passed unconditionally, and would have gone on
+  # passing with the backend completely stopped. Half of this gate was decoration.
+  # Hence the content-type assertion below: text/html here means the request was
+  # served by the static fallback and never reached the application.
+  #
+  # /api/v1/health does not exist (the app mounts /health at the root); probing the
+  # /api/v1 prefix matters independently, because that prefix is what the frontend
+  # bundle is built to call, so vehicle-brands — a real unauthenticated GET — is
+  # what proves the whole path end to end.
+  for url in https://evelio.net/health https://evelio.net/api/v1/vehicle-brands; do
+    out="$(curl -sS -o /dev/null -m 15 -w '%{http_code} %{content_type}' "$url" 2>/dev/null || echo '000 -')"
+    code="${out%% *}"; ct="${out#* }"
+    if [[ ! "$code" =~ ^(200|204)$ ]]; then
       warn "HTTP $url -> $code"; bad=1
+    elif [[ "$ct" == text/html* ]]; then
+      warn "HTTP $url -> $code but content-type is '$ct' — that is the SPA fallback,
+       not the API. The request never reached the backend."; bad=1
+    else
+      ok "HTTP $url -> $code"
     fi
   done
   return $bad

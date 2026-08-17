@@ -74,6 +74,13 @@ lists that drive restore), `backend/` (pre-deploy code snapshot),
   i.e. the expected path) therefore exited with production stopped and nothing
   saying so. It now traps signals only, and `on_abort` calls `_rds_cleanup`
   itself. `selftest.sh` case 10 asserts the caller's EXIT trap survives an abort.
+- **Never end a function with `(( n )) && cmd`.** Under `set -e` a function whose
+  last executed statement is a false `&&` guard returns non-zero, and that status
+  becomes the status of the *call* — which is not exempt, so the caller dies on
+  the spot. (At top level the same line is exempt and harmless, which is exactly
+  why the pattern looks safe.) In `rollback_code` it would abandon production
+  half-rolled-back. Both manifest-writing guards are now explicit `if` blocks;
+  use `if`, or end the function with an explicit `return 0`.
 - **Signals must be handled, not just errors.** A bash script killed by a signal
   runs its EXIT trap with `$? == 0`. Without the `INTERRUPTED` flag that
   `on_signal` sets, a Ctrl-C or dropped SSH mid-deploy would look like success
@@ -181,7 +188,25 @@ lists that drive restore), `backend/` (pre-deploy code snapshot),
   them where no database is named `evelio`. If the machine dies there, that file
   is the only thing on disk that says what happened. `assert_no_breadcrumb`
   blocks both scripts until a human resolves it, and `restart_all` refuses to
-  start services when `evelio` does not exist.
+  start services when `evelio` does not exist — or when it exists but is still
+  closed to connections, which is the same crash-loop with a more confusing log.
+- **…but it must only exist when the data's location is actually unknown.**
+  `revert.sh` writes the breadcrumb *before* the restore starts, yet almost every
+  abort happens in the long pre-swap phase — `pg_restore` failed, the row counts
+  did not match, the dump was corrupt, the telemetry carry-over failed — where
+  production is provably bit-identical. Leaving it behind there turned the
+  **expected** failure path into "an earlier database swap did not finish",
+  blocked the next `update.sh`/`revert.sh`/`--prune-aside`, and sent the operator
+  hunting for `evelio_prerevert_*` databases that were never created. That is the
+  `--force`-cries-wolf problem again, and worse: an operator who learns to delete
+  `.swap-in-progress` reflexively will also delete it in the one case it exists
+  for. `restore_db_swap` therefore publishes **`RDS_DB_STATE`** (`safe` /
+  `unresolved`), flipping to `unresolved` only after the *first rename succeeds*
+  and back to `safe` once the data is provably under a known name again; `on_abort`
+  clears the breadcrumb on `safe` and keeps it — loudly — on `unresolved`. A crash
+  hard enough that no trap runs also leaves it in place, which is correct.
+  `selftest.sh` case 13 asserts both transitions and that `on_abort` is still
+  wired to them.
 
 ### Files
 
@@ -255,6 +280,31 @@ lists that drive restore), `backend/` (pre-deploy code snapshot),
 - **`run-tests.sh` distinguishes exit 1 (tests failed) from exit 2 (could not
   run).** Conflating them would let an infrastructure failure read as "nothing
   failed" and deploy on the strength of a suite that never ran.
+- **That distinction is per FILE, not just per run.** pytest's exit code says
+  which happened: `1` is a real regression signal, but `5` (collected no tests),
+  `2`/`3` (INTERNALERROR) and `4` (usage) all mean *this file never ran*. Counting
+  those as `FAIL` was the same conflation one level down — `update.sh` printed
+  "fix or delete the failing tests in the app repo" about files in which nothing
+  failed because nothing executed. Exit `5` is how a standalone
+  `python3 test_x.py` script reports itself when run under pytest, and exit `2` is
+  what a module-scope `sys.exit()` produces; two such files were reporting
+  `SystemExit: 0` — they ran their own checks, **passed**, and were recorded as
+  failing tests. Any unrunnable file now makes the whole gate exit 2, even when
+  other files genuinely failed: if part of the suite did not execute, the green
+  files do not add up to a verdict.
+- **`MIN_TEST_FILES` counts files, not assertions.** It proves the suite exists;
+  it cannot prove the suite *runs*. The per-file classification above is what
+  closes the rest of that gap — without it, fixing the two genuinely failing
+  files would have turned the gate green while half of it asserted nothing.
+- **A migration that will not apply to the throwaway database is exit 2.** It was
+  a bare `warn`, so the run carried on against a schema-incomplete database and
+  every test touching the missing tables errored in collection — reported as
+  failing tests, blamed on the app repo. Infrastructure is infrastructure.
+- **The gate replays migrations in the SAME order production does.** Both callers
+  now go through `migration_files()` in `lib/common.sh` (git add-order). The gate
+  used to use a plain `migrate_*.sql` glob, i.e. alphabetical, so the schema it
+  tested against was assembled differently from the one production gets — and
+  these migrations are *not* independent (`migrate_fleets.sql` needs `users`).
 - **One process per test file.** Several app test modules stub each other in
   `sys.modules`; a shared pytest process fails on pollution alone.
 - **The prod-connection guard must be a real module plus a ONE-LINE `import`
@@ -272,6 +322,34 @@ lists that drive restore), `backend/` (pre-deploy code snapshot),
   from `/etc/tesla-oauth.env` for its pre-flight check, never their values, and
   it parses only `VITE_*` lines out of the build config rather than sourcing it
   (a stray line in a sourced file could redefine `WEBROOT` or `PG_DB`).
+- **The API is on `evelio.net`; `app.evelio.net` is static-only.** Caddy's
+  `app.evelio.net` block is `root /var/www/evelio-app` plus
+  `try_files {path} /index.html`, with **no `reverse_proxy` at all**. Only
+  `evelio.net` proxies `/health*`, `/api/v1/*`, `/tesla/*` and `/enode/callback*`
+  to `127.0.0.1:8080`. This one fact caused two separate bugs, so it is written
+  down rather than re-derived:
+  - `frontend-build.env.template` shipped
+    `VITE_API_BASE=https://app.evelio.net/api/v1`. A bundle built from that gets
+    `index.html` and a **200** back for every API call — a frontend that is
+    completely broken while nothing anywhere reports an error, and the bundle gate
+    cannot catch it because that gate only proves the bundle contains the base we
+    passed *in*. The correct value is `https://evelio.net/api/v1`, which is also
+    the app's own default in `frontend/src/lib.js` and what the deployed bundle
+    has always contained.
+  - `check_http()` probed `https://app.evelio.net/api/v1/health`, which the SPA
+    fallback answers `200 text/html`. That probe **could not fail** — it would
+    have passed with the backend stopped, leaving post-deploy backend
+    verification resting on `evelio.net/health` alone. It now probes
+    `evelio.net/health` and `evelio.net/api/v1/vehicle-brands` (a real
+    unauthenticated JSON GET) and **fails on a `text/html` content-type**,
+    because HTML there means the static fallback served it and the request never
+    reached the application. Note `/api/v1/health` does not exist — the app mounts
+    `/health` at the root — so the `/api/v1` prefix needs a real route to prove it.
+- **Recovering the frontend build values:** both live in the deployed bundle under
+  `$WEBROOT`, so production is its own source of truth if `frontend-build.env` is
+  ever lost. The Turnstile **site** key is public by design (it ships to every
+  browser); the *secret* key is not in the bundle, is not recoverable this way,
+  and is not this tool's business.
 - **The bundle is verified before publishing**: it must contain the configured
   prod API base and must not reference a dev/staging host, and a Cloudflare
   *testing* sitekey (`1x…/2x…/3x…`) is rejected outright — checked on the **built
@@ -315,12 +393,27 @@ avoids it entirely.
 
 These are the app repo's to fix, not this one's:
 
-1. **9 of 14 test files fail on `main`** — blocks every deploy under the strict
-   gate.
-2. **`package-lock.json` is gitignored**, so `npm ci` can never work and the
+1. **The test suite does not currently give the gate a verdict** (measured
+   2026-08-17, `origin/main`). The old "9 of 14 fail" reading was wrong: of those
+   nine, **seven never executed a single assertion** — they are standalone
+   `python3 test_x.py` scripts, not pytest modules (`combined_fleet_driver`,
+   `fleet_master_link`, `fleet_onboarding`, `nonfleet_onboarding`,
+   `repush_active` collect no tests; `fleet_naming` and `fleet_pending_members`
+   call `sys.exit()` at module scope and both exit **0**, i.e. their own checks
+   pass). Only **two** files hold genuine failures: `test_outage_detector.py`
+   (1 of 17) and `test_notify_outage_integration.py` (2 of 10), all three about
+   outage severity classification — consistent with one behaviour change, not
+   nine. The app repo needs to expose pytest-collectable `test_*` functions in
+   those seven files (or drop them and lower `MIN_TEST_FILES`), and fix the
+   outage classifier or its tests.
+2. **`migrate_fleets.sql` does not apply to an empty database** — it needs a
+   `users` table that **no** `migrate_*.sql` in the repo creates, in either
+   replay order. Production has `users` already, so deploys are unaffected; the
+   throwaway test database cannot be built at all, which is now exit 2.
+3. **`package-lock.json` is gitignored**, so `npm ci` can never work and the
    build falls back to `npm install`. Production builds are not reproducible
    until a lockfile is committed.
-3. **The run-dir holds CRLF files and server-only scripts** (`recover_token.py`,
+4. **The run-dir holds CRLF files and server-only scripts** (`recover_token.py`,
    `get_access_token*.sh`) that git has never seen.
 
 ## Relationship to the staging tooling

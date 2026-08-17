@@ -22,6 +22,23 @@ _RDS_SIDE=""
 _RDS_LOCKED=0
 _RDS_DONE=0
 
+# Where production's data is, as far as this library knows:
+#
+#   safe        production is provably under "$PG_DB" (or was never touched)
+#   unresolved  we are inside — or came out badly from — the two-rename window,
+#               so which name holds the data is not known from here
+#
+# The CALLER's breadcrumb is the on-disk record of the "unresolved" state, and it
+# blocks every later run until a human clears it. That is correct when the data
+# might be under another name, and pure noise otherwise — and noise is expensive
+# here: an operator who learns to delete .swap-in-progress reflexively will also
+# delete it in the one case it exists for. Every abort BEFORE the first rename
+# (pg_restore failed, row counts did not match, the dump was corrupt, the
+# telemetry carry-over failed, CREATE DATABASE failed) leaves production
+# bit-identical, and those are the EXPECTED paths, not the rare ones. So this
+# flag tells revert.sh's on_abort which of the two it is looking at.
+RDS_DB_STATE="safe"
+
 # Dropped side databases and re-opened connections on ANY exit — including
 # Ctrl-C, SIGTERM and a dropped SSH session, which the previous version leaked
 # (a 6.5 GB orphan per interrupted run, on the same filesystem as production
@@ -62,6 +79,8 @@ restore_db_swap() {   # $1 = dump file, $2 = rowcounts file, $3 = full|soft
   side="evelio_restore_$ts"
   ASIDE_DB="evelio_prerevert_$ts"
   _RDS_SIDE="$side"; _RDS_LOCKED=0; _RDS_DONE=0
+  # Nothing has been renamed yet, so production is provably where it belongs.
+  RDS_DB_STATE="safe"
   # Signals only — this function must NOT install an EXIT trap. revert.sh's EXIT
   # trap (on_abort) is the ONLY thing that restarts the services and cron it
   # stopped; replacing it here meant every aborted restore (row-count mismatch,
@@ -192,13 +211,20 @@ restore_db_swap() {   # $1 = dump file, $2 = rowcounts file, $3 = full|soft
   # window, and the caller writes it before calling us.
   info "swapping databases"
   trap '' INT TERM HUP
+  # A rename that FAILS changes nothing, so the state only becomes uncertain once
+  # one has actually succeeded — set the flag after, not before.
   psql_maint -c "ALTER DATABASE \"$PG_DB\" RENAME TO \"$ASIDE_DB\"" >/dev/null \
     || { trap _rds_on_signal INT TERM HUP; _rds_cleanup
          die "could not rename the live database — nothing changed."; }
+  # From here until one of the two exits below, no database is named "$PG_DB".
+  RDS_DB_STATE="unresolved"
 
   if ! psql_maint -c "ALTER DATABASE \"$side\" RENAME TO \"$PG_DB\"" >/dev/null; then
     warn "second rename failed — putting the original database back"
     if psql_maint -c "ALTER DATABASE \"$ASIDE_DB\" RENAME TO \"$PG_DB\"" >/dev/null; then
+      # The original is back under its own name: resolved, and the caller may
+      # clear its breadcrumb.
+      RDS_DB_STATE="safe"
       trap _rds_on_signal INT TERM HUP
       _rds_cleanup
       die "swap aborted — the production database is unchanged and back in place."
@@ -217,6 +243,10 @@ restore_db_swap() {   # $1 = dump file, $2 = rowcounts file, $3 = full|soft
            -c 'ALTER DATABASE \"$PG_DB\" WITH ALLOW_CONNECTIONS true'
        Do NOT start the services until both succeed."
   fi
+
+  # Both renames are done and the restored copy is under "$PG_DB": the location of
+  # production's data is known again, whatever happens below.
+  RDS_DB_STATE="safe"
 
   # The rename carried the ALLOW_CONNECTIONS=false with the old name; make sure
   # the database that is now live accepts connections again. This is NOT optional

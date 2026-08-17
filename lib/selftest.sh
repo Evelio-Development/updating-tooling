@@ -267,6 +267,72 @@ check "restore refused a malformed row-count file" "$(( rc != 0 ))" "1"
 check "no side database left behind" \
   "$(psql_maint -tAc "select count(*) from pg_database where datname like 'evelio_restore_%'")" "0"
 
+# --------------------------------------------------------------- case 13 --
+# The breadcrumb blocks every later run until a human clears it, which is right
+# when production's data might be under another name and pure noise otherwise.
+# revert.sh writes it BEFORE the restore starts, but almost every abort happens in
+# the long pre-swap phase (pg_restore, verification, telemetry carry-over) where
+# production is provably untouched — so leaving it behind turned the EXPECTED
+# failure path into "an earlier database swap did not finish", pointing the
+# operator at evelio_prerevert_* databases that were never created. An operator who
+# learns to delete that file reflexively will also delete it in the one case it
+# exists for. restore_db_swap therefore publishes RDS_DB_STATE, and this asserts
+# the two transitions revert.sh's on_abort keys on.
+hdr "13. an abort BEFORE the swap must not leave a swap-in-progress breadcrumb"
+BREADCRUMB="$WORK/.swap-in-progress"
+
+# Exactly what revert.sh does: breadcrumb, restore, and on abort clear it only if
+# the library says the data's location is known.
+run_like_revert() {   # $1 = rowcounts file ; echoes the resulting RDS_DB_STATE
+  breadcrumb_write <<<"a swap was in progress"
+  (
+    trap 'printf "%s" "${RDS_DB_STATE:-unset}" > "$WORK/state"
+          [[ "${RDS_DB_STATE:-safe}" == "safe" ]] && breadcrumb_clear' EXIT
+    restore_db_swap "$WORK/db.dump" "$1" full
+  ) >/dev/null 2>&1
+  cat "$WORK/state"
+}
+
+fresh_live
+take_backup
+cp "$WORK/rowcounts.pre" "$WORK/rowcounts.bad13"
+sed -i 's/^public\.users|10/public.users|999/' "$WORK/rowcounts.bad13"
+before="$(q 'select count(*) from users')"
+state="$(run_like_revert "$WORK/rowcounts.bad13")"
+check "row-count abort reports the data as located"  "$state" "safe"
+check "no stale breadcrumb after a pre-swap abort" \
+  "$([[ -f "$BREADCRUMB" ]] && echo present || echo gone)" "gone"
+check "live database still untouched"                "$(q 'select count(*) from users')" "$before"
+
+# A corrupt dump aborts even earlier — before the side database is even created.
+fresh_live
+take_backup
+truncate -s "$(( $(stat -c%s "$WORK/db.dump") * 2 / 5 ))" "$WORK/db.dump"
+state="$(run_like_revert "$WORK/rowcounts.pre")"
+check "corrupt-dump abort reports the data as located" "$state" "safe"
+check "no stale breadcrumb after a corrupt-dump abort" \
+  "$([[ -f "$BREADCRUMB" ]] && echo present || echo gone)" "gone"
+
+# And a SUCCESSFUL swap must end in the same state, or revert.sh would keep a
+# breadcrumb on the happy path and block the next run.
+fresh_live
+take_backup
+state="$(run_like_revert "$WORK/rowcounts.pre")"
+check "successful swap reports the data as located"  "$state" "safe"
+check "no breadcrumb after a successful swap" \
+  "$([[ -f "$BREADCRUMB" ]] && echo present || echo gone)" "gone"
+BREADCRUMB="$UPD_ROOT/.swap-in-progress"
+
+# The three checks above prove the LIBRARY publishes the right state; they cannot
+# prove revert.sh still acts on it, because run_like_revert re-implements the rule
+# (driving the real on_abort would need the full prod layout and live services).
+# So assert the wiring is present. Structural, but the alternative is a contract
+# with a verified producer and an unverified consumer.
+check "revert.sh's on_abort still keys the breadcrumb on RDS_DB_STATE" \
+  "$(awk '/^on_abort\(\)/,/^}/' "$HERE/bin/revert.sh" \
+     | grep -qE 'RDS_DB_STATE' && grep -qE 'breadcrumb_clear' <(awk '/^on_abort\(\)/,/^}/' "$HERE/bin/revert.sh") \
+     && echo wired || echo MISSING)" "wired"
+
 # ------------------------------------------------------------------ done --
 hdr "$( (( FAIL )) && echo "${C_RED}selftest: $FAIL failed, $PASS passed${C_OFF}" || echo "${C_GRN}selftest: all $PASS checks passed${C_OFF}")"
 exit $(( FAIL > 0 ))
